@@ -2147,12 +2147,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.error(
-                "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
+                "[%s] Failed to send Telegram voice/audio: %s",
                 self.name,
                 e,
                 exc_info=True,
             )
-            return await super().send_voice(chat_id, audio_path, caption, reply_to)
+            return SendResult(success=False, error=str(e))
 
     async def send_multiple_images(
         self,

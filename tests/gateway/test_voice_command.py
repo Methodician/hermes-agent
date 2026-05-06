@@ -51,7 +51,7 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from gateway.platforms.base import MessageEvent, MessageType, SessionSource
+from gateway.platforms.base import MessageEvent, MessageType, SendResult, SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +432,24 @@ class TestSendVoiceReply:
         mock_adapter.send_voice.assert_called_once()
         call_args = mock_adapter.send_voice.call_args
         assert call_args.kwargs.get("chat_id") == "123"
+
+    @pytest.mark.asyncio
+    async def test_send_voice_failure_is_logged_without_crash(self, runner):
+        mock_adapter = AsyncMock()
+        mock_adapter.send_voice = AsyncMock(return_value=SendResult(success=False, error="telegram rejected voice"))
+        event = _make_event()
+        runner.adapters[event.source.platform] = mock_adapter
+
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
+
+        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
+             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.unlink"), \
+             patch("os.makedirs"):
+            await runner._send_voice_reply(event, "Hello world")
+
+        mock_adapter.send_voice.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_empty_text_after_strip_skips(self, runner):
