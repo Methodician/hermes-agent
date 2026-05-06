@@ -8802,7 +8802,13 @@ class GatewayRunner:
                         }
                         if event.source.thread_id:
                             send_kwargs["metadata"] = {"thread_id": event.source.thread_id}
-                        await adapter.send_voice(**send_kwargs)
+                        send_result = await adapter.send_voice(**send_kwargs)
+                        if send_result and not getattr(send_result, "success", True):
+                            logger.warning(
+                                "Auto voice reply send failed: %s",
+                                getattr(send_result, "error", "unknown error"),
+                            )
+                            return None
                 finally:
                     for p in {audio_path, actual_path} - {None}:
                         try:
