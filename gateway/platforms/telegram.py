@@ -87,6 +87,15 @@ from gateway.platforms.telegram_network import (
 from utils import atomic_replace
 
 
+TELEGRAM_IMAGE_DOCUMENT_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
 def check_telegram_requirements() -> bool:
     """Check if Telegram dependencies are available."""
     return TELEGRAM_AVAILABLE
@@ -3245,8 +3254,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     ext = mime_to_ext.get(doc.mime_type, "")
 
                 if not ext and doc.mime_type:
+                    image_mime_to_ext = {
+                        v: k for k, v in TELEGRAM_IMAGE_DOCUMENT_TYPES.items()
+                    }
+                    ext = image_mime_to_ext.get(doc.mime_type, "")
+
+                if not ext and doc.mime_type:
                     video_mime_to_ext = {v: k for k, v in SUPPORTED_VIDEO_TYPES.items()}
                     ext = video_mime_to_ext.get(doc.mime_type, "")
+
+                if ext in TELEGRAM_IMAGE_DOCUMENT_TYPES:
+                    file_obj = await doc.get_file()
+                    image_bytes = await file_obj.download_as_bytearray()
+                    raw_bytes = bytes(image_bytes)
+                    cached_path = cache_image_from_bytes(raw_bytes, ext=ext)
+                    event.media_urls = [cached_path]
+                    event.media_types = [TELEGRAM_IMAGE_DOCUMENT_TYPES[ext]]
+                    event.message_type = MessageType.PHOTO
+                    logger.info("[Telegram] Cached user image document at %s", cached_path)
+                    await self.handle_message(event)
+                    return
 
                 if ext in SUPPORTED_VIDEO_TYPES:
                     file_obj = await doc.get_file()
