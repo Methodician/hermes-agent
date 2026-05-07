@@ -1247,9 +1247,25 @@ class GatewayRunner:
 
     _VOICE_MODE_PATH = _hermes_home / "gateway_voice_mode.json"
 
-    def _voice_key(self, platform: Platform, chat_id: str) -> str:
+    def _voice_key(self, platform: Platform, chat_id: str, thread_id: str | None = None) -> str:
         """Return a platform-namespaced key for voice mode state."""
-        return f"{platform.value}:{chat_id}"
+        base = f"{platform.value}:{chat_id}"
+        return f"{base}:{thread_id}" if thread_id else base
+
+    def _voice_mode_for_source(self, source: SessionSource) -> str:
+        """Return voice mode for a source, preferring topic-specific state."""
+        thread_id = getattr(source, "thread_id", None)
+        if thread_id:
+            topic_key = self._voice_key(source.platform, source.chat_id, str(thread_id))
+            if topic_key in self._voice_mode:
+                return self._voice_mode.get(topic_key, "off")
+        chat_key = self._voice_key(source.platform, source.chat_id)
+        if chat_key in self._voice_mode:
+            return self._voice_mode.get(chat_key, "off")
+        # Some older tests/in-memory callers used raw chat_id keys before
+        # persisted voice mode state became platform-prefixed. Keep this as a
+        # compatibility fallback, but never write new raw keys.
+        return self._voice_mode.get(source.chat_id, "off")
 
     def _load_voice_modes(self) -> Dict[str, str]:
         try:
@@ -8357,7 +8373,7 @@ class GatewayRunner:
         args = event.get_command_args().strip().lower()
         chat_id = event.source.chat_id
         platform = event.source.platform
-        voice_key = self._voice_key(platform, chat_id)
+        voice_key = self._voice_key(platform, chat_id, event.source.thread_id)
 
         adapter = self.adapters.get(platform)
 
@@ -8643,8 +8659,7 @@ class GatewayRunner:
         if not response or response.startswith("Error:"):
             return False
 
-        chat_id = event.source.chat_id
-        voice_mode = self._voice_mode.get(self._voice_key(event.source.platform, chat_id), "off")
+        voice_mode = self._voice_mode_for_source(event.source)
         is_voice_input = (event.message_type == MessageType.VOICE)
 
         should = (
@@ -8691,8 +8706,7 @@ class GatewayRunner:
         """
         if not tts_chunks or len(tts_chunks) <= 1:
             return False
-        chat_id = event.source.chat_id
-        return self._voice_mode.get(chat_id, "off") == "all"
+        return self._voice_mode_for_source(event.source) == "all"
 
     @staticmethod
     def _is_telegram_source(source: SessionSource) -> bool:
@@ -8711,7 +8725,7 @@ class GatewayRunner:
         """
         if not self._is_telegram_source(source):
             return False
-        return self._voice_mode.get(source.chat_id, "off") == "all"
+        return self._voice_mode_for_source(source) == "all"
 
     async def _send_audio_primary_text_chunks(
         self,
