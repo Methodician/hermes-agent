@@ -86,6 +86,22 @@ from gateway.platforms.telegram_network import (
 )
 from utils import atomic_replace
 
+_TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_TELEGRAM_IMAGE_MIME_TO_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+_TELEGRAM_IMAGE_EXT_TO_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
 
 TELEGRAM_IMAGE_DOCUMENT_TYPES = {
     ".png": "image/png",
@@ -362,10 +378,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @classmethod
     def _message_thread_id_for_typing(cls, thread_id: Optional[str]) -> Optional[int]:
-        # Mirrors _message_thread_id_for_send: the General forum topic (thread id
-        # "1") is represented as "no thread id" on the wire. User-created topics
-        # keep their real id so typing stays scoped to that topic.
-        if not thread_id or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID:
+        # Asymmetric with _message_thread_id_for_send on purpose. Telegram's
+        # sendMessage and sendChatAction treat thread id "1" (the forum General
+        # topic) differently: sends reject message_thread_id=1 and must omit it,
+        # but sendChatAction needs message_thread_id=1 to place the typing
+        # bubble in the General topic (omitting it hides the bubble entirely
+        # from the client's view of that topic). Preserve the real id here —
+        # sends still map "1" → None via _message_thread_id_for_send.
+        if not thread_id:
             return None
         return int(thread_id)
 
@@ -1210,19 +1230,30 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
         
         try:
-            # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(
-                formatted, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
-            )
-            if len(chunks) > 1:
-                # truncate_message appends a raw " (1/2)" suffix. Escape the
-                # MarkdownV2-special parentheses so Telegram doesn't reject the
-                # chunk and fall back to plain text.
-                chunks = [
-                    re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk)
-                    for chunk in chunks
-                ]
+            # Split raw Markdown first, then format each chunk independently.
+            # Formatting the whole response before splitting can leave fenced
+            # code blocks invalid when Telegram parses each chunk on its own.
+            # Because MarkdownV2 escaping can expand text, retry with a smaller
+            # raw budget until every formatted chunk fits Telegram's UTF-16
+            # message limit.
+            raw_limit = self.MAX_MESSAGE_LENGTH
+            for _ in range(8):
+                raw_chunks = self.truncate_message(
+                    content, raw_limit, len_fn=utf16_len,
+                )
+                chunks = [self.format_message(chunk) for chunk in raw_chunks]
+                if all(utf16_len(chunk) <= self.MAX_MESSAGE_LENGTH for chunk in chunks):
+                    break
+                worst_len = max(utf16_len(chunk) for chunk in chunks)
+                next_limit = int(raw_limit * (self.MAX_MESSAGE_LENGTH - 64) / worst_len)
+                raw_limit = max(512, min(raw_limit - 1, next_limit))
+            else:
+                # Extremely escape-heavy text still exceeded the limit after
+                # adaptive shrinking.  Fall back to formatted splitting rather
+                # than sending over-limit text; this path should be rare.
+                chunks = self.truncate_message(
+                    self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len,
+                )
             
             message_ids = []
             thread_id = self._metadata_thread_id(metadata)
@@ -2764,6 +2795,20 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_allowed_chats(self) -> set[str]:
+        """Return the whitelist of group/supergroup chat IDs the bot will respond in.
+
+        When non-empty, group messages from chats NOT in this set are silently
+        ignored — even if the bot is @mentioned.  DMs are never filtered.
+        Empty set means no restriction (fully backward compatible).
+        """
+        raw = self.config.extra.get("allowed_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_ALLOWED_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_ignored_threads(self) -> set[int]:
         raw = self.config.extra.get("ignored_threads")
         if raw is None:
@@ -2912,13 +2957,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """Apply Telegram group trigger rules.
 
         DMs remain unrestricted. Group/supergroup messages are accepted when:
+        - the chat passes the ``allowed_chats`` whitelist (when set)
         - the chat is explicitly allowlisted in ``free_response_chats``
         - ``require_mention`` is disabled
         - the message replies to the bot
         - the bot is @mentioned
         - the text/caption matches a configured regex wake-word pattern
 
-        When ``require_mention`` is enabled, slash commands are not given
+        When ``allowed_chats`` is non-empty, it acts as a hard gate — messages
+        from any chat not in the list are ignored regardless of the other
+        rules.  When ``require_mention`` is enabled, slash commands are not given
         special treatment — they must pass the same mention/reply checks
         as any other group message.  Users can still trigger commands via
         the Telegram bot menu (``/command@botname``) or by explicitly
@@ -2927,6 +2975,14 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._is_group_chat(message):
             return True
+        # allowed_chats check (whitelist — must pass before other gating).
+        # When set, group messages from chats NOT in this whitelist are
+        # silently ignored, even if @mentioned.  DMs are already excluded above.
+        allowed = self._telegram_allowed_chats()
+        if allowed:
+            chat_id_str = str(getattr(getattr(message, "chat", None), "id", ""))
+            if chat_id_str not in allowed:
+                return False
         thread_id = getattr(message, "message_thread_id", None)
         if thread_id is not None:
             try:
@@ -3248,10 +3304,59 @@ class TelegramAdapter(BasePlatformAdapter):
                     _, ext = os.path.splitext(original_filename)
                     ext = ext.lower()
 
+                # Normalize mime_type for robust comparisons (some clients send
+                # uppercase like "IMAGE/PNG").
+                doc_mime = (doc.mime_type or "").lower()
+
                 # If no extension from filename, reverse-lookup from MIME type
-                if not ext and doc.mime_type:
-                    mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
-                    ext = mime_to_ext.get(doc.mime_type, "")
+                if not ext and doc_mime:
+                    ext = _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, "")
+                    if not ext:
+                        mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
+                        ext = mime_to_ext.get(doc_mime, "")
+
+                # Check file size early so image documents cannot bypass the
+                # document size limit by taking the image path.
+                MAX_DOC_BYTES = 20 * 1024 * 1024
+                if not doc.file_size or doc.file_size > MAX_DOC_BYTES:
+                    event.text = (
+                        "The document is too large or its size could not be verified. "
+                        "Maximum: 20 MB."
+                    )
+                    logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
+                    await self.handle_message(event)
+                    return
+
+                # Telegram may deliver screenshots/photos as documents. If the
+                # payload is actually an image, route it through the image cache
+                # and batching path instead of rejecting it as a document.
+                if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
+                    file_obj = await doc.get_file()
+                    image_bytes = await file_obj.download_as_bytearray()
+                    image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
+                    try:
+                        cached_path = cache_image_from_bytes(bytes(image_bytes), ext=image_ext)
+                    except ValueError as e:
+                        logger.warning("[Telegram] Failed to cache image document: %s", e, exc_info=True)
+                        event.text = (
+                            f"Image document '{original_filename or doc_mime or ext or 'unknown'}' "
+                            "could not be read as an image."
+                        )
+                        await self.handle_message(event)
+                        return
+
+                    event.message_type = MessageType.PHOTO
+                    event.media_urls = [cached_path]
+                    event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
+                    logger.info("[Telegram] Cached user image-document at %s", cached_path)
+
+                    media_group_id = getattr(msg, "media_group_id", None)
+                    if media_group_id:
+                        await self._queue_media_group_event(str(media_group_id), event)
+                    else:
+                        batch_key = self._photo_batch_key(event, msg)
+                        self._enqueue_photo_event(batch_key, event)
+                    return
 
                 if not ext and doc.mime_type:
                     image_mime_to_ext = {
@@ -3294,17 +3399,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         f"Supported types: {supported_list}"
                     )
                     logger.info("[Telegram] Unsupported document type: %s", ext or "unknown")
-                    await self.handle_message(event)
-                    return
-
-                # Check file size (Telegram Bot API limit: 20 MB)
-                MAX_DOC_BYTES = 20 * 1024 * 1024
-                if not doc.file_size or doc.file_size > MAX_DOC_BYTES:
-                    event.text = (
-                        "The document is too large or its size could not be verified. "
-                        "Maximum: 20 MB."
-                    )
-                    logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
                     await self.handle_message(event)
                     return
 

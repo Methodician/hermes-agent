@@ -434,7 +434,7 @@ class TestSendVoiceReply:
         assert call_args.kwargs.get("chat_id") == "123"
 
     @pytest.mark.asyncio
-    async def test_send_voice_failure_is_logged_without_crash(self, runner):
+    async def test_send_voice_failure_returns_none_without_success_status(self, runner):
         mock_adapter = AsyncMock()
         mock_adapter.send_voice = AsyncMock(return_value=SendResult(success=False, error="telegram rejected voice"))
         event = _make_event()
@@ -447,8 +447,9 @@ class TestSendVoiceReply:
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
-            await runner._send_voice_reply(event, "Hello world")
+            result = await runner._send_voice_reply(event, "Hello world")
 
+        assert result is None
         mock_adapter.send_voice.assert_called_once()
 
     @pytest.mark.asyncio

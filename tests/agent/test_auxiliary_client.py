@@ -3,7 +3,9 @@
 import json
 import logging
 import os
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
@@ -24,6 +26,7 @@ from agent.auxiliary_client import (
     _normalize_aux_provider,
     _try_payment_fallback,
     _resolve_auto,
+    _CodexCompletionsAdapter,
 )
 
 
@@ -55,6 +58,18 @@ def codex_auth_dir(tmp_path, monkeypatch):
         lambda: "codex-test-token-abc123",
     )
     return codex_dir
+
+
+class TestAuxiliaryMaxTokensParam:
+    def test_uses_max_completion_tokens_for_github_copilot_custom_base(self):
+        with patch("agent.auxiliary_client._resolve_custom_runtime", return_value=("https://api.githubcopilot.com", "key", None)), \
+             patch("agent.auxiliary_client._read_nous_auth", return_value=None):
+            assert auxiliary_max_tokens_param(2048) == {"max_completion_tokens": 2048}
+
+    def test_uses_max_completion_tokens_for_github_copilot_custom_base_path(self):
+        with patch("agent.auxiliary_client._resolve_custom_runtime", return_value=("https://api.githubcopilot.com/chat/completions", "key", None)), \
+             patch("agent.auxiliary_client._read_nous_auth", return_value=None):
+            assert auxiliary_max_tokens_param(2048) == {"max_completion_tokens": 2048}
 
 
 class TestNormalizeAuxProvider:
@@ -262,6 +277,104 @@ class TestAnthropicOAuthFlag:
 
 
 class TestBuildCodexClient:
+    def test_codex_backend_omits_unsupported_sampling_kwargs(self):
+        kwargs = _build_call_kwargs(
+            "auto",
+            "gpt-5.5",
+            [{"role": "user", "content": "remember this"}],
+            temperature=0.3,
+            max_tokens=5120,
+            timeout=30,
+            base_url="https://chatgpt.com/backend-api/codex/",
+        )
+
+        assert "temperature" not in kwargs
+        assert "max_tokens" not in kwargs
+        assert "max_completion_tokens" not in kwargs
+
+    def test_codex_adapter_converts_tool_messages_to_responses_items(self):
+        from types import SimpleNamespace
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        captured = {}
+
+        class _FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter([])
+
+            def get_final_response(self):
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        content=[SimpleNamespace(type="output_text", text="ok")],
+                    )],
+                    usage=None,
+                )
+
+        class _FakeResponses:
+            def stream(self, **kwargs):
+                captured.update(kwargs)
+                return _FakeStream()
+
+        fake_client = SimpleNamespace(responses=_FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.2-codex")
+        adapter.create(
+            messages=[
+                {"role": "system", "content": "You are Hermes."},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_abc123",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": "call_abc123", "content": "file contents"},
+                {"role": "user", "content": "remember this"},
+            ],
+        )
+
+        assert captured["instructions"] == "You are Hermes."
+        assert all(item.get("role") != "tool" for item in captured["input"])
+        assert any(item.get("type") == "function_call" for item in captured["input"])
+        function_output = next(
+            item for item in captured["input"] if item.get("type") == "function_call_output"
+        )
+        assert function_output["call_id"] == "call_abc123"
+        assert function_output["output"] == "file contents"
+
+    def test_codex_adapter_converts_object_tool_calls_to_responses_items(self):
+        from types import SimpleNamespace
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [SimpleNamespace(
+                    id="call_obj123",
+                    type="function",
+                    function=SimpleNamespace(name="read_file", arguments="{}"),
+                )],
+            },
+            {"role": "tool", "tool_call_id": "call_obj123", "content": "file contents"},
+        ]
+
+        items = _chat_messages_to_responses_input(messages)
+
+        function_call = next(item for item in items if item.get("type") == "function_call")
+        assert function_call["call_id"] == "call_obj123"
+        assert function_call["name"] == "read_file"
+        function_output = next(
+            item for item in items if item.get("type") == "function_call_output"
+        )
+        assert function_output["call_id"] == "call_obj123"
+        assert function_output["output"] == "file contents"
+
     def test_pool_without_selected_entry_falls_back_to_auth_store(self):
         with (
             patch("agent.auxiliary_client._select_pool_entry", return_value=(True, None)),
@@ -1880,6 +1993,85 @@ class TestVisionAutoSkipsKimiCoding:
             "kimi-coding",
             "kimi-coding-cn",
         })
+
+
+class TestCodexAuxiliaryAdapterTimeout:
+    def test_forwards_timeout_to_responses_stream(self):
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_response(self):
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="summary")],
+                    )],
+                    usage=None,
+                )
+
+        class FakeResponses:
+            def __init__(self):
+                self.kwargs = None
+
+            def stream(self, **kwargs):
+                self.kwargs = kwargs
+                return FakeStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        response = adapter.create(
+            messages=[{"role": "user", "content": "summarize this"}],
+            timeout=12.5,
+        )
+
+        assert fake_client.responses.kwargs["timeout"] == 12.5
+        assert response.choices[0].message.content == "summary"
+
+    def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        class SlowAliveStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                for _ in range(5):
+                    time.sleep(0.03)
+                    yield SimpleNamespace(type="response.in_progress")
+
+            def get_final_response(self):
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        content=[SimpleNamespace(type="output_text", text="late")],
+                    )],
+                    usage=None,
+                )
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return SlowAliveStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            adapter.create(
+                messages=[{"role": "user", "content": "summarize this"}],
+                timeout=0.05,
+            )
+
+        assert time.monotonic() - started < 0.14
 
 
 # ---------------------------------------------------------------------------

@@ -455,6 +455,12 @@ def _to_openai_base_url(base_url: str) -> str:
     """
     url = str(base_url or "").strip().rstrip("/")
     if url.endswith("/anthropic"):
+        # ZAI (open.bigmodel.cn) uses /api/anthropic for Anthropic wire
+        # but /api/paas/v4 for OpenAI wire — the generic /v1 rewrite is wrong.
+        if "open.bigmodel.cn" in url or "bigmodel" in url:
+            rewritten = url[: -len("/anthropic")] + "/paas/v4"
+            logger.debug("Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten)
+            return rewritten
         rewritten = url[: -len("/anthropic")] + "/v1"
         logger.debug("Auxiliary client: rewrote base URL %s → %s", url, rewritten)
         return rewritten
@@ -513,54 +519,6 @@ def _pool_runtime_base_url(entry: Any, fallback: str = "") -> str:
 # calls to the Codex Responses API so callers don't need any changes.
 
 
-def _convert_content_for_responses(content: Any) -> Any:
-    """Convert chat.completions content to Responses API format.
-
-    chat.completions uses:
-      {"type": "text", "text": "..."}
-      {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
-
-    Responses API uses:
-      {"type": "input_text", "text": "..."}
-      {"type": "input_image", "image_url": "data:image/png;base64,..."}
-
-    If content is a plain string, it's returned as-is (the Responses API
-    accepts strings directly for text-only messages).
-    """
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return str(content) if content else ""
-
-    converted: List[Dict[str, Any]] = []
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-        ptype = part.get("type", "")
-        if ptype == "text":
-            converted.append({"type": "input_text", "text": part.get("text", "")})
-        elif ptype == "image_url":
-            # chat.completions nests the URL: {"image_url": {"url": "..."}}
-            image_data = part.get("image_url", {})
-            url = image_data.get("url", "") if isinstance(image_data, dict) else str(image_data)
-            entry: Dict[str, Any] = {"type": "input_image", "image_url": url}
-            # Preserve detail if specified
-            detail = image_data.get("detail") if isinstance(image_data, dict) else None
-            if detail:
-                entry["detail"] = detail
-            converted.append(entry)
-        elif ptype in ("input_text", "input_image"):
-            # Already in Responses format — pass through
-            converted.append(part)
-        else:
-            # Unknown content type — try to preserve as text
-            text = part.get("text", "")
-            if text:
-                converted.append({"type": "input_text", "text": text})
-
-    return converted or ""
-
-
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
@@ -573,28 +531,38 @@ class _CodexCompletionsAdapter:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
-        # Separate system/instructions from conversation messages.
-        # Convert chat.completions multimodal content blocks to Responses
-        # API format (input_text / input_image instead of text / image_url).
+        # Separate system/instructions from conversation messages, then use
+        # the shared Codex conversion path for input. Passing chat-style
+        # {"role": "tool"} messages directly to Responses 400s with
+        # "Invalid value: 'tool'"; the shared adapter converts them into
+        # function_call_output items and also preserves assistant tool calls.
         instructions = "You are a helpful assistant."
-        input_msgs: List[Dict[str, Any]] = []
+        input_source: List[Dict[str, Any]] = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content") or ""
             if role == "system":
                 instructions = content if isinstance(content, str) else str(content)
             else:
-                input_msgs.append({
-                    "role": role,
-                    "content": _convert_content_for_responses(content),
-                })
+                input_source.append(msg)
 
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input
+
+        input_msgs = _chat_messages_to_responses_input(input_source)
         resp_kwargs: Dict[str, Any] = {
             "model": model,
             "instructions": instructions,
             "input": input_msgs or [{"role": "user", "content": ""}],
             "store": False,
         }
+
+        # Preserve the chat.completions timeout contract. This adapter is used
+        # by auxiliary calls such as context compression; if the timeout is not
+        # forwarded and enforced, a Codex Responses stream can sit behind a
+        # dead-looking CLI until the user force-interrupts the whole session.
+        timeout = kwargs.get("timeout")
+        if timeout is not None:
+            resp_kwargs["timeout"] = timeout
 
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
@@ -653,6 +621,37 @@ class _CodexCompletionsAdapter:
         text_parts: List[str] = []
         tool_calls_raw: List[Any] = []
         usage = None
+        total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
+        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
+        timed_out = threading.Event()
+        timeout_timer: Optional[threading.Timer] = None
+
+        def _timeout_message() -> str:
+            return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
+
+        def _close_client_on_timeout() -> None:
+            timed_out.set()
+            close = getattr(self._client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
+
+        def _check_cancelled() -> None:
+            if deadline is not None and time.monotonic() >= deadline:
+                timed_out.set()
+                raise TimeoutError(_timeout_message())
+            try:
+                from tools.interrupt import is_interrupted
+                if is_interrupted():
+                    raise InterruptedError("Codex auxiliary Responses stream interrupted")
+            except InterruptedError:
+                raise
+            except Exception:
+                # Interrupt state is a best-effort UX hook; never make it a
+                # new failure mode for auxiliary calls.
+                pass
 
         try:
             # Collect output items and text deltas during streaming —
@@ -661,8 +660,14 @@ class _CodexCompletionsAdapter:
             collected_output_items: List[Any] = []
             collected_text_deltas: List[str] = []
             has_function_calls = False
+            if total_timeout:
+                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
+                timeout_timer.daemon = True
+                timeout_timer.start()
+            _check_cancelled()
             with self._client.responses.stream(**resp_kwargs) as stream:
                 for _event in stream:
+                    _check_cancelled()
                     _etype = getattr(_event, "type", "")
                     if _etype == "response.output_item.done":
                         _done = getattr(_event, "item", None)
@@ -674,6 +679,7 @@ class _CodexCompletionsAdapter:
                             collected_text_deltas.append(_delta)
                     elif "function_call" in _etype:
                         has_function_calls = True
+                _check_cancelled()
                 final = stream.get_final_response()
 
             # Backfill empty output from collected stream events
@@ -733,8 +739,13 @@ class _CodexCompletionsAdapter:
                     total_tokens=getattr(resp_usage, "total_tokens", 0),
                 )
         except Exception as exc:
+            if timed_out.is_set():
+                raise TimeoutError(_timeout_message()) from exc
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
+        finally:
+            if timeout_timer is not None:
+                timeout_timer.cancel()
 
         content = "".join(text_parts).strip() or None
 
@@ -828,7 +839,14 @@ class _AnthropicCompletionsAdapter:
         model = kwargs.get("model", self._model)
         tools = kwargs.get("tools")
         tool_choice = kwargs.get("tool_choice")
-        max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 2000
+        # ZAI's Anthropic-compatible endpoint rejects max_tokens on vision
+        # models (glm-4v-flash etc.) with error code 1210.  When the caller
+        # signals this by setting _skip_zai_max_tokens in kwargs, omit it.
+        _skip_mt = kwargs.pop("_skip_zai_max_tokens", False)
+        if _skip_mt:
+            max_tokens = None
+        else:
+            max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 2000
         temperature = kwargs.get("temperature")
 
         normalized_tool_choice = None
@@ -2077,6 +2095,20 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         )
     elif base_url_host_matches(sync_base_url, "api.kimi.com"):
         async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+    else:
+        # Fall back to profile.default_headers for providers that declare
+        # client-level headers on their ProviderProfile (e.g. attribution
+        # User-Agent strings). Provider is inferred from the hostname.
+        try:
+            from agent.model_metadata import _infer_provider_from_url
+            from providers import get_provider_profile as _gpf_async
+            _inferred = _infer_provider_from_url(sync_base_url)
+            if _inferred:
+                _ph_async = _gpf_async(_inferred)
+                if _ph_async and _ph_async.default_headers:
+                    async_kwargs["default_headers"] = dict(_ph_async.default_headers)
+        except Exception:
+            pass
     return AsyncOpenAI(**async_kwargs), model
 
 
@@ -2304,6 +2336,16 @@ def resolve_provider_client(
                 extra["default_headers"] = copilot_request_headers(
                     is_agent_turn=True, is_vision=is_vision
                 )
+            else:
+                # Fall back to profile.default_headers for providers that
+                # declare client-level attribution headers on their profile.
+                try:
+                    from providers import get_provider_profile as _gpf_custom
+                    _ph_custom = _gpf_custom(provider)
+                    if _ph_custom and _ph_custom.default_headers:
+                        extra["default_headers"] = dict(_ph_custom.default_headers)
+                except Exception:
+                    pass
             client = OpenAI(api_key=custom_key, base_url=_clean_base, **extra)
             client = _wrap_if_needed(client, final_model, custom_base, custom_key)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
@@ -2492,6 +2534,18 @@ def resolve_provider_client(
             headers.update(copilot_request_headers(
                 is_agent_turn=True, is_vision=is_vision
             ))
+        else:
+            # Fall back to profile.default_headers for providers that declare
+            # client-level attribution headers on their profile (e.g. GMI
+            # User-Agent for traffic identification, Vercel AI Gateway
+            # Referer/Title for analytics).
+            try:
+                from providers import get_provider_profile as _gpf_main
+                _ph_main = _gpf_main(provider)
+                if _ph_main and _ph_main.default_headers:
+                    headers.update(_ph_main.default_headers)
+            except Exception:
+                pass
         client = OpenAI(api_key=api_key, base_url=base_url,
                         **({"default_headers": headers} if headers else {}))
 
@@ -2835,6 +2889,33 @@ def resolve_vision_provider_client(
         )
         return _finalize(requested, sync_client, default_model)
 
+    # ZAI vision models must use the OpenAI-compatible endpoint, not the
+    # Anthropic-compatible one (which may be the main-runtime default).
+    # The Anthropic wire rejects max_tokens on multimodal calls (error 1210),
+    # while the OpenAI wire handles it correctly.
+    if requested == "zai" and not resolved_base_url:
+        zai_openai_urls = [
+            "https://open.bigmodel.cn/api/paas/v4",
+            "https://api.z.ai/api/paas/v4",
+        ]
+        for _zai_url in zai_openai_urls:
+            client, final_model = _get_cached_client(
+                requested, resolved_model, async_mode,
+                base_url=_zai_url,
+                api_key=resolved_api_key or None,
+                api_mode="chat_completions",
+                is_vision=True,
+            )
+            if client is not None:
+                return _finalize(requested, client, final_model)
+        # Fallback: try without explicit base_url (old behavior)
+        client, final_model = _get_cached_client(requested, resolved_model, async_mode,
+                                                 api_mode=resolved_api_mode,
+                                                 is_vision=True)
+        if client is None:
+            return requested, None, None
+        return requested, client, final_model
+
     client, final_model = _get_cached_client(requested, resolved_model, async_mode,
                                              api_mode=resolved_api_mode,
                                              is_vision=True)
@@ -2862,10 +2943,11 @@ def auxiliary_max_tokens_param(value: int) -> dict:
     """
     custom_base = _current_custom_base_url()
     or_key = os.getenv("OPENROUTER_API_KEY")
-    # Only use max_completion_tokens for direct OpenAI custom endpoints
+    # Use max_completion_tokens for direct OpenAI-compatible providers that reject
+    # max_tokens on newer GPT-4o/o-series/GPT-5-style models.
     if (not or_key
             and _read_nous_auth() is None
-            and base_url_hostname(custom_base) == "api.openai.com"):
+            and base_url_hostname(custom_base) in {"api.openai.com", "api.githubcopilot.com"}):
         return {"max_completion_tokens": value}
     return {"max_tokens": value}
 
@@ -3387,13 +3469,28 @@ def _build_call_kwargs(
         if _forbids_sampling_params(model):
             temperature = None
 
-    if temperature is not None:
+    is_codex_backend = (
+        provider == "openai-codex"
+        or base_url_host_matches(base_url, "chatgpt.com")
+    )
+
+    if temperature is not None and not is_codex_backend:
         kwargs["temperature"] = temperature
 
-    if max_tokens is not None:
-        # Codex adapter handles max_tokens internally; OpenRouter/Nous use max_tokens.
+    if max_tokens is not None and not is_codex_backend:
+        # Codex's chatgpt.com Responses endpoint rejects both max_tokens and
+        # max_completion_tokens for auxiliary calls. OpenRouter/Nous use max_tokens.
         # Direct OpenAI api.openai.com with newer models needs max_completion_tokens.
-        if provider == "custom":
+        # ZAI vision models (glm-4v-flash, glm-4v-plus, etc.) reject max_tokens with
+        # error code 1210 ("API 调用参数有误") on multimodal requests — skip it.
+        _model_lower = (model or "").lower()
+        _skip_max_tokens = (
+            provider == "zai"
+            and ("4v" in _model_lower or "5v" in _model_lower or "-v" in _model_lower)
+        )
+        if _skip_max_tokens:
+            pass  # ZAI vision models do not accept max_tokens
+        elif provider == "custom":
             custom_base = base_url or _current_custom_base_url()
             if base_url_hostname(custom_base) == "api.openai.com":
                 kwargs["max_completion_tokens"] = max_tokens
@@ -3624,13 +3721,23 @@ def call_llm(
                 kwargs = retry_kwargs
 
         err_str = str(first_err)
+        # ZAI vision models (glm-4v-flash etc.) return error code 1210
+        # ("API 调用参数有误") when max_tokens is passed on multimodal
+        # calls.  The error message does NOT contain "max_tokens" so the
+        # generic retry below never fires.  Detect the ZAI-specific error
+        # and strip max_tokens before retrying.
+        _is_zai_param_error = (
+            "1210" in err_str
+            and "bigmodel" in str(getattr(client, "base_url", ""))
+        )
         if max_tokens is not None and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
+            or _is_zai_param_error
         ):
             kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
+            kwargs.pop("max_completion_tokens", None)
             try:
                 return _validate_llm_response(
                     client.chat.completions.create(**kwargs), task)
@@ -3930,13 +4037,23 @@ async def async_call_llm(
                 kwargs = retry_kwargs
 
         err_str = str(first_err)
+        # ZAI vision models (glm-4v-flash etc.) return error code 1210
+        # ("API 调用参数有误") when max_tokens is passed on multimodal
+        # calls.  The error message does NOT contain "max_tokens" so the
+        # generic retry below never fires.  Detect the ZAI-specific error
+        # and strip max_tokens before retrying.
+        _is_zai_param_error = (
+            "1210" in err_str
+            and "bigmodel" in str(getattr(client, "base_url", ""))
+        )
         if max_tokens is not None and (
             "max_tokens" in err_str
             or "unsupported_parameter" in err_str
             or _is_unsupported_parameter_error(first_err, "max_tokens")
+            or _is_zai_param_error
         ):
             kwargs.pop("max_tokens", None)
-            kwargs["max_completion_tokens"] = max_tokens
+            kwargs.pop("max_completion_tokens", None)
             try:
                 return _validate_llm_response(
                     await client.chat.completions.create(**kwargs), task)
