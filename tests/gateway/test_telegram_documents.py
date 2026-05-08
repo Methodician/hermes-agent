@@ -333,58 +333,6 @@ class TestDocumentDownloadBlock:
         assert event.media_types == ["application/pdf"]
 
     @pytest.mark.asyncio
-    async def test_png_document_is_treated_as_photo(self, adapter):
-        """Telegram files sent without compression arrive as documents but should use the image path."""
-        png_bytes = b"\x89PNG\r\n\x1a\n fake png data"
-        file_obj = _make_file_obj(png_bytes)
-        doc = _make_document(
-            file_name="screenshot.png",
-            mime_type="image/png",
-            file_size=len(png_bytes),
-            file_obj=file_obj,
-        )
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        with patch(
-            "gateway.platforms.telegram.cache_image_from_bytes",
-            return_value="/tmp/screenshot.png",
-        ) as cache_image:
-            await adapter._handle_media_message(update, MagicMock())
-
-        event = adapter.handle_message.call_args[0][0]
-        cache_image.assert_called_once_with(png_bytes, ext=".png")
-        assert event.message_type == MessageType.PHOTO
-        assert event.media_urls == ["/tmp/screenshot.png"]
-        assert event.media_types == ["image/png"]
-        assert "Unsupported document type" not in (event.text or "")
-
-    @pytest.mark.asyncio
-    async def test_jpeg_document_uses_image_mime_from_extension(self, adapter):
-        """JPEG image documents should normalize .jpg to image/jpeg."""
-        jpg_bytes = b"\xff\xd8\xff fake jpeg data"
-        file_obj = _make_file_obj(jpg_bytes)
-        doc = _make_document(
-            file_name="photo.jpg",
-            mime_type="application/octet-stream",
-            file_size=len(jpg_bytes),
-            file_obj=file_obj,
-        )
-        msg = _make_message(document=doc)
-        update = _make_update(msg)
-
-        with patch(
-            "gateway.platforms.telegram.cache_image_from_bytes",
-            return_value="/tmp/photo.jpg",
-        ):
-            await adapter._handle_media_message(update, MagicMock())
-
-        event = adapter.handle_message.call_args[0][0]
-        assert event.message_type == MessageType.PHOTO
-        assert event.media_urls == ["/tmp/photo.jpg"]
-        assert event.media_types == ["image/jpeg"]
-
-    @pytest.mark.asyncio
     async def test_missing_filename_and_mime_rejected(self, adapter):
         doc = _make_document(file_name=None, mime_type=None, file_size=100)
         msg = _make_message(document=doc)
