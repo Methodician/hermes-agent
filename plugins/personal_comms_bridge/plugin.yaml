@@ -1,0 +1,7 @@
+name: personal-comms-bridge
+version: 0.1.0
+description: "Local-only read-only Hermes client for Jake's private personal-comms-bridge sidecar. Exposes bridge health, connector status, recent previews, and attention radar over localhost HTTP."
+author: Jake local
+kind: standalone
+provides_tools:
+  - personal_comms_bridge
