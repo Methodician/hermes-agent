@@ -41,7 +41,7 @@ class CommsBridgeHTTPError(CommsBridgeError):
 @dataclass(frozen=True)
 class BridgeClient:
     base_url: str = DEFAULT_BRIDGE_URL
-    timeout: float = 3.0
+    timeout: float = 10.0
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         url = _join_url(self.base_url, path, params=params)
@@ -201,7 +201,7 @@ def _client_from_env(*, timeout_default: float) -> BridgeClient:
     return BridgeClient(base_url=base_url.rstrip("/"), timeout=timeout)
 
 
-def _timeout_from_env(default: float = 3.0) -> float:
+def _timeout_from_env(default: float = 10.0) -> float:
     raw = os.getenv(BRIDGE_TIMEOUT_ENV)
     if not raw:
         return default

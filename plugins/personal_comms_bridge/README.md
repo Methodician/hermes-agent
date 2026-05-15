@@ -43,7 +43,7 @@ Optional environment variables:
 
 ```bash
 export PERSONAL_COMMS_BRIDGE_URL=http://127.0.0.1:8765
-export PERSONAL_COMMS_BRIDGE_TIMEOUT=3
+export PERSONAL_COMMS_BRIDGE_TIMEOUT=10
 ```
 
 Do not restart the live gateway unless Jake explicitly approves. CLI sessions and tests can exercise the integration without touching gateway state.
