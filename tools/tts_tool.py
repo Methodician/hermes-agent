@@ -696,10 +696,10 @@ def _has_ffmpeg() -> bool:
 
 def _convert_to_opus(mp3_path: str) -> Optional[str]:
     """
-    Convert an MP3 file to OGG Opus format for Telegram voice bubbles.
+    Convert an audio file to OGG Opus format for Telegram voice bubbles.
 
     Args:
-        mp3_path: Path to the input MP3 file.
+        mp3_path: Path to the input audio file.
 
     Returns:
         Path to the .ogg file, or None if conversion fails.
@@ -707,7 +707,13 @@ def _convert_to_opus(mp3_path: str) -> Optional[str]:
     if not _has_ffmpeg():
         return None
 
-    ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
+    # Edge and several other providers can write MP3/WAV bytes to a
+    # caller-supplied ``.ogg`` path. Never ask ffmpeg to read and write the
+    # same file; use a distinct voice-bubble output path in that case.
+    if mp3_path.lower().endswith(".ogg"):
+        ogg_path = mp3_path[:-4] + ".voice.ogg"
+    else:
+        ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
     try:
         result = subprocess.run(
             ["ffmpeg", "-i", mp3_path, "-acodec", "libopus",
@@ -1712,14 +1718,38 @@ def text_to_speech_tool(
 
             if edge_available:
                 logger.info("Generating speech with Edge TTS...")
-                try:
-                    import concurrent.futures
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        pool.submit(
-                            lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
-                        ).result(timeout=60)
-                except RuntimeError:
-                    asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                import concurrent.futures
+
+                last_error: Exception | None = None
+                for attempt in range(1, 4):
+                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    future = pool.submit(
+                        lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                    )
+                    success = False
+                    try:
+                        future.result(timeout=60)
+                        last_error = None
+                        success = True
+                    except RuntimeError as e:
+                        last_error = e
+                        asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+                        last_error = None
+                        success = True
+                    except concurrent.futures.TimeoutError as e:
+                        future.cancel()
+                        last_error = e
+                        logger.warning("Edge TTS timed out on attempt %d/3", attempt)
+                    except Exception as e:
+                        last_error = e
+                        logger.warning("Edge TTS failed on attempt %d/3: %s", attempt, e)
+                    finally:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                    if success:
+                        break
+
+                if last_error is not None:
+                    raise last_error
             elif _check_neutts_available():
                 logger.info("Edge TTS not available, falling back to NeuTTS (local)...")
                 provider = "neutts"
@@ -1751,7 +1781,7 @@ def text_to_speech_tool(
                     if opus_path:
                         file_str = opus_path
                 voice_compatible = file_str.endswith(".ogg")
-        elif provider in ("edge", "neutts", "minimax", "xai", "kittentts", "piper") and not file_str.endswith(".ogg"):
+        elif provider in ("edge", "neutts", "minimax", "xai", "kittentts", "piper"):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
                 file_str = opus_path
