@@ -442,15 +442,42 @@ class TestSendVoiceReply:
 
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
-        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
-             patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t), \
-             patch("os.path.isfile", return_value=True), \
-             patch("os.unlink"), \
-             patch("os.makedirs"):
+        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result),              patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t),              patch("os.path.isfile", return_value=True),              patch("os.unlink"),              patch("os.makedirs"):
             result = await runner._send_voice_reply(event, "Hello world")
 
         assert result is None
         mock_adapter.send_voice.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_auto_voice_reply_uses_thread_metadata_helper(self, runner):
+        from gateway.config import Platform
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send_voice = AsyncMock()
+        event = _make_event()
+        event.source.platform = Platform.TELEGRAM
+        event.source.chat_type = "dm"
+        event.source.thread_id = "20197"
+        event.message_id = "462"
+        runner.adapters[event.source.platform] = mock_adapter
+
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
+
+        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result),              patch("tools.tts_tool._strip_markdown_for_tts", side_effect=lambda t: t),              patch("os.path.isfile", return_value=True),              patch("os.unlink"),              patch("os.makedirs"):
+            await runner._send_voice_reply(event, "Hello world")
+
+        mock_adapter.send_voice.assert_called_once()
+        call_kwargs = mock_adapter.send_voice.call_args.kwargs
+        assert call_kwargs["reply_to"] == "462"
+        assert call_kwargs["metadata"] == {
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "20197",
+            "telegram_reply_to_message_id": "462",
+            # Final voice reply is notify-worthy (issue #27970 Bug 2):
+            # mirrors the final-text path in gateway/platforms/base.py.
+            "notify": True,
+        }
 
     @pytest.mark.asyncio
     async def test_empty_text_after_strip_skips(self, runner):
@@ -461,6 +488,52 @@ class TestSendVoiceReply:
             await runner._send_voice_reply(event, "```code only```")
 
         mock_tts.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_telegram_audio_primary_mirrors_original_markdown_not_tts_text(self, runner):
+        """Audio-primary visible Telegram text must not use TTS-stripped chunks."""
+        mock_adapter = AsyncMock()
+        mock_adapter.send_voice = AsyncMock(return_value=SendResult(success=True))
+        mock_adapter.send = AsyncMock(return_value=SendResult(success=True))
+        mock_adapter.truncate_message = MagicMock(side_effect=lambda text, *args, **kwargs: [text])
+        event = _make_event(chat_id="123")
+        runner.adapters[event.source.platform] = mock_adapter
+        runner._voice_mode["telegram:123"] = "all"
+
+        response = """The real spawnable assignees are:
+
+```text
+default
+uxorchestrator
+```
+
+## My recommendation
+
+- **Most tasks:** `default`
+- **UX/product/repo implementation loops:** `uxorchestrator`
+"""
+        stripped = """The real spawnable assignees are:
+
+My recommendation
+
+Most tasks: default
+UX/product/repo implementation loops: uxorchestrator
+"""
+        tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
+
+        with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
+             patch("tools.tts_tool._strip_markdown_for_tts", return_value=stripped), \
+             patch("tools.tts_tool.chunk_tts_text", return_value=[stripped[:40], stripped[40:]]), \
+             patch("os.path.isfile", return_value=True), \
+             patch("os.unlink"), \
+             patch("os.makedirs"):
+            result = await runner._send_voice_reply(event, response)
+
+        assert result["audio_primary"] is True
+        assert result["mirrored_text"] is True
+        sent_text = mock_adapter.send.call_args.args[1]
+        assert "```text\ndefault\nuxorchestrator\n```" in sent_text
+        assert "## My recommendation" in sent_text
 
     @pytest.mark.asyncio
     async def test_tts_failure_no_crash(self, runner):
