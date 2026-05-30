@@ -93,7 +93,10 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
         result = check_for_updates()
 
     assert result == 5
-    assert mock_run.call_count == 3  # origin probe + git fetch + git rev-list
+    calls = [call.args[0] for call in mock_run.call_args_list]
+    assert ["git", "remote"] in calls
+    assert ["git", "fetch", "origin", "--quiet"] in calls
+    assert ["git", "rev-list", "--count", "HEAD..origin/main"] in calls
 
 
 def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):
@@ -108,6 +111,8 @@ def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
+        if cmd == ["git", "remote"]:
+            return MagicMock(returncode=0, stdout="origin\n")
         if cmd == ["git", "remote", "get-url", "origin"]:
             return MagicMock(returncode=0, stdout="git@github.com:NousResearch/hermes-agent.git\n")
         if cmd == ["git", "rev-parse", "HEAD"]:
@@ -126,6 +131,34 @@ def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):
 
     assert result == banner.UPDATE_AVAILABLE_NO_COUNT
     assert ["git", "fetch", "origin", "--quiet"] not in calls
+
+
+def test_check_for_updates_prefers_upstream_remote(tmp_path, monkeypatch):
+    """Local git update checks should compare against upstream/main when that remote exists."""
+    from hermes_cli.banner import check_for_updates
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(json.dumps({"ts": 0, "behind": 1}))
+
+    def fake_run(args, **kwargs):
+        if args == ["git", "remote"]:
+            return MagicMock(returncode=0, stdout="origin\nupstream\n")
+        if args == ["git", "fetch", "upstream", "--quiet"]:
+            return MagicMock(returncode=0, stdout="")
+        if args == ["git", "rev-list", "--count", "HEAD..upstream/main"]:
+            return MagicMock(returncode=0, stdout="7\n")
+        raise AssertionError(f"unexpected subprocess call: {args!r}")
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run) as mock_run:
+        result = check_for_updates()
+
+    assert result == 7
+    assert mock_run.call_count == 3
 
 
 def test_check_for_updates_no_git_dir(tmp_path, monkeypatch):
