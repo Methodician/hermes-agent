@@ -11691,16 +11691,22 @@ class GatewayRunner:
         if not should:
             return False
 
-        # Dedup: agent already called TTS tool
-        has_agent_tts = any(
-            msg.get("role") == "assistant"
-            and any(
+        # Dedup only for the current turn: if this assistant response already
+        # called text_to_speech, do not synthesize a second automatic voice.
+        # Do not scan the whole session history — an old TTS tool call would
+        # otherwise suppress auto-TTS forever in long-lived Telegram topics.
+        has_agent_tts_this_turn = False
+        for msg in reversed(agent_messages or []):
+            role = msg.get("role")
+            if role == "user":
+                break
+            if role == "assistant" and any(
                 tc.get("function", {}).get("name") == "text_to_speech"
                 for tc in (msg.get("tool_calls") or [])
-            )
-            for msg in agent_messages
-        )
-        if has_agent_tts:
+            ):
+                has_agent_tts_this_turn = True
+                break
+        if has_agent_tts_this_turn:
             return False
 
         # Dedup: base adapter auto-TTS already handles voice input
