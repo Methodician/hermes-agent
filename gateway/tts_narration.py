@@ -23,9 +23,6 @@ from typing import Any, Dict, Iterable, List, Optional
 from hermes_constants import get_hermes_home
 from tools.tts_tool import text_to_speech_tool
 
-DEFAULT_PROVIDER = "openrouter-coral"
-DEFAULT_MODEL = "openai/gpt-audio-mini"
-DEFAULT_VOICE = "coral"
 DEFAULT_TARGET_CHARS = 1000
 DEFAULT_MAX_CHARS = 1200
 
@@ -393,26 +390,54 @@ class NarrationJobStore:
             conn.commit()
 
 
-def provider_metadata_from_config() -> Dict[str, str]:
-    """Return explicit long-form provider metadata.
+def provider_metadata_from_config() -> Dict[str, Optional[str]]:
+    """Return optional long-form narration provider metadata.
 
-    The config shape is intentionally narrow and optional.  If absent, the
-    product-required Coral route is explicit rather than silently inheriting an
-    unrelated global TTS provider.
+    Narration defaults to the same provider resolution path as the regular
+    ``text_to_speech`` tool: when no narration-specific override is configured,
+    ``provider`` is left as ``None`` so ``text_to_speech_tool`` uses
+    ``tts.provider`` and the matching provider config.  Users may override only
+    narration via either of these config shapes::
+
+        tts:
+          narration:
+            provider: openai
+            model: gpt-4o-mini-tts
+            voice: coral
+
+        voice:
+          long_form_tts:   # legacy/local prototype spelling
+            primary_provider: openai
+            model: gpt-4o-mini-tts
+            voice: coral
     """
-    provider = DEFAULT_PROVIDER
-    model = DEFAULT_MODEL
-    voice = DEFAULT_VOICE
+    provider = None
+    model = None
+    voice = None
     try:
         from hermes_cli.config import load_config
         cfg = load_config() or {}
-        lf = ((cfg.get("voice") or {}).get("long_form_tts") or {})
-        provider = str(lf.get("primary_provider") or provider).strip() or provider
-        model = str(lf.get("model") or model).strip() or model
-        voice = str(lf.get("voice") or voice).strip() or voice
+        tts_cfg = cfg.get("tts") or {}
+        narration_cfg = (tts_cfg.get("narration") or {}) if isinstance(tts_cfg, dict) else {}
+        legacy_cfg = ((cfg.get("voice") or {}).get("long_form_tts") or {})
+        provider = (
+            narration_cfg.get("provider")
+            or narration_cfg.get("primary_provider")
+            or legacy_cfg.get("primary_provider")
+            or legacy_cfg.get("provider")
+        )
+        model = narration_cfg.get("model") or legacy_cfg.get("model")
+        voice = narration_cfg.get("voice") or legacy_cfg.get("voice")
     except Exception:
         pass
-    return {"provider": provider, "model": model, "voice": voice}
+
+    def clean(value):
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
+    return {"provider": clean(provider), "model": clean(model), "voice": clean(voice)}
 
 
 def sanitize_error(error: Any) -> str:

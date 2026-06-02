@@ -9,11 +9,12 @@ This backlog tracks local refinements for the long-form `/voice narrate` prototy
    - Manually transplant only narration-specific hunks onto a fresh branch from `upstream/main`.
    - Acceptance: no unrelated deletions in `gateway/run.py` / `gateway/platforms/base.py`; `tests/gateway` collects successfully.
 
-2. **Preserve upstream TTS provider flexibility**
-   - Replace hardcoded long-form defaults with config-driven behavior that can inherit the normal `tts.provider` path or use an explicit long-form override.
-   - Proposed config shape:
-     - `tts.long_form.provider` or `voice.long_form_tts.primary_provider`
-     - optional `model`, `voice`, chunk policy, and fallback behavior
+2. **Preserve upstream TTS provider flexibility** — *implemented locally; keep covered in PR extraction*
+   - Long-form narration now leaves `provider=None` when no narration override is configured, so `text_to_speech_tool` follows the normal `tts.provider` resolution path.
+   - Optional override shape:
+     - `tts.narration.provider`
+     - optional `model` / `voice` metadata
+     - legacy/local compatibility: `voice.long_form_tts.primary_provider`
    - Acceptance: Edge/default TTS still works; custom command providers work; OpenRouter/Coral route can be selected without code changes.
 
 3. **Wire model/voice metadata or remove unused fields**

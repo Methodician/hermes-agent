@@ -58,6 +58,45 @@ class TestNarrationChunking:
         assert chunk_narration_text("   \n\n  ") == []
 
 
+class TestNarrationProviderMetadata:
+    def test_defaults_to_regular_tts_provider_path_without_override(self, monkeypatch):
+        from gateway import tts_narration
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tts": {"provider": "edge", "providers": {"edge": {"voice": "en-US"}}}},
+        )
+
+        assert tts_narration.provider_metadata_from_config() == {
+            "provider": None,
+            "model": None,
+            "voice": None,
+        }
+
+    def test_tts_narration_override_is_explicit_and_optional(self, monkeypatch):
+        from gateway import tts_narration
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "tts": {
+                    "provider": "edge",
+                    "narration": {
+                        "provider": "openai",
+                        "model": "gpt-4o-mini-tts",
+                        "voice": "coral",
+                    },
+                }
+            },
+        )
+
+        assert tts_narration.provider_metadata_from_config() == {
+            "provider": "openai",
+            "model": "gpt-4o-mini-tts",
+            "voice": "coral",
+        }
+
+
 class TestNarrationStore:
     def test_enqueue_persists_job_and_chunks_without_full_text_in_job_row(self, tmp_path):
         from gateway.tts_narration import NarrationJobStore, chunk_narration_text
