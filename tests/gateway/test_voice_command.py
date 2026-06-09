@@ -188,6 +188,8 @@ class TestHandleVoiceCommand:
         from gateway.config import Platform
         runner._voice_mode = {
             "telegram:off_chat": "off",
+            "telegram:narration_chat": "narration",
+            "telegram:topic_chat:1495": "narration",
             "telegram:on_chat": "voice_only",
             "telegram:tts_chat": "all",
             "slack:999": "voice_only",  # wrong platform, must be ignored
@@ -201,7 +203,7 @@ class TestHandleVoiceCommand:
 
         runner._sync_voice_mode_state_to_adapter(adapter)
 
-        assert adapter._auto_tts_disabled_chats == {"off_chat"}
+        assert adapter._auto_tts_disabled_chats == {"off_chat", "narration_chat", "topic_chat:1495"}
         assert adapter._auto_tts_enabled_chats == {"on_chat", "tts_chat"}
 
     def test_sync_pushes_config_default_onto_adapter(self, runner, monkeypatch):
@@ -2922,7 +2924,7 @@ class TestUDPKeepalive:
 # =====================================================================
 
 class TestShouldAutoTtsForChat:
-    """Three-layer gate: per-chat enable > per-chat disable > config default."""
+    """Voice-first auto-TTS gate, including topic overrides."""
 
     def _make_adapter(self, *, default: bool, enabled=(), disabled=()):
         """Build a bare adapter with only the attrs the gate reads."""
@@ -2956,7 +2958,7 @@ class TestShouldAutoTtsForChat:
         assert fn(adapter, "chat1") is False
 
     def test_enabled_wins_over_disabled(self):
-        """An explicit enable beats an explicit disable (enable takes priority)."""
+        """Preserve the historical chat-level priority for stale mixed state."""
         fn, adapter = self._make_adapter(
             default=False, enabled={"chat1"}, disabled={"chat1"}
         )
@@ -2967,3 +2969,24 @@ class TestShouldAutoTtsForChat:
         fn, adapter = self._make_adapter(default=False, enabled={"chat1"})
         assert fn(adapter, "chat1") is True
         assert fn(adapter, "chat2") is False
+
+    def test_topic_narration_suppresses_default_auto_tts_for_voice_input(self):
+        """Topic /voice narrate keeps base voice-first auto-TTS off even when global default is on."""
+        fn, adapter = self._make_adapter(default=True, disabled={"chat1:1495"})
+        source = SessionSource(platform=MagicMock(), chat_id="chat1", user_id="user1", thread_id="1495")
+
+        assert fn(adapter, "chat1", source) is False
+
+    def test_topic_narration_suppresses_chat_auto_tts_opt_in(self):
+        """A topic narration override wins over chat-level /voice on|tts."""
+        fn, adapter = self._make_adapter(default=False, enabled={"chat1"}, disabled={"chat1:1495"})
+        source = SessionSource(platform=MagicMock(), chat_id="chat1", user_id="user1", thread_id="1495")
+
+        assert fn(adapter, "chat1", source) is False
+
+    def test_topic_auto_tts_opt_in_overrides_chat_off(self):
+        """Topic /voice on|tts still wins over chat-level /voice off."""
+        fn, adapter = self._make_adapter(default=False, enabled={"chat1:1495"}, disabled={"chat1"})
+        source = SessionSource(platform=MagicMock(), chat_id="chat1", user_id="user1", thread_id="1495")
+
+        assert fn(adapter, "chat1", source) is True

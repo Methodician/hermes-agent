@@ -1880,16 +1880,16 @@ class BasePlatformAdapter(ABC):
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
         # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
-        # Per-chat overrides live in two sets populated from ``_voice_mode``:
+        # Per-chat/per-topic overrides live in two sets populated from ``_voice_mode``:
         #   - ``_auto_tts_enabled_chats``: chat explicitly opted in via ``/voice on``
         #     or ``/voice tts`` (mode is ``voice_only`` or ``all``). Fires even when
         #     the global default is False.
         #   - ``_auto_tts_disabled_chats``: chat explicitly opted out via
         #     ``/voice off`` (mode is ``off``). Suppresses auto-TTS even when the
         #     global default is True.
-        # The gate in _process_message() is:
-        #   fire if chat in _auto_tts_enabled_chats
-        #     OR (_auto_tts_default and chat not in _auto_tts_disabled_chats)
+        # Topic-scoped keys are stored as ``<chat_id>:<thread_id>`` and win over
+        # chat-scoped keys. ``/voice narrate`` is also a hard suppressor for this
+        # voice-first path because long-form narration is text-first and deferred.
         self._auto_tts_default: bool = False
         self._auto_tts_enabled_chats: set = set()
         self._auto_tts_disabled_chats: set = set()
@@ -2114,18 +2114,31 @@ class BasePlatformAdapter(ABC):
     def fatal_error_retryable(self) -> bool:
         return self._fatal_error_retryable
 
-    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
-        """Whether auto-TTS on voice input should fire for ``chat_id``.
+    def _should_auto_tts_for_chat(self, chat_id: str, source: Optional[SessionSource] = None) -> bool:
+        """Whether voice-first auto-TTS should fire for a voice input.
 
-        Decision layers (Issue #16007):
-          1. Explicit ``/voice on`` or ``/voice tts`` → always fire (even if
-             ``voice.auto_tts`` is False).
-          2. Explicit ``/voice off`` → never fire.
-          3. Fall back to the global ``voice.auto_tts`` config default.
+        Decision layers (Issue #16007 + topic-scoped narration):
+          1. Explicit topic ``/voice off`` or ``/voice narrate`` → never fire.
+          2. Explicit topic ``/voice on`` or ``/voice tts`` → fire.
+          3. Explicit chat ``/voice on`` or ``/voice tts`` → fire.
+          4. Explicit chat ``/voice off`` or ``/voice narrate`` → never fire.
+          5. Fall back to the global ``voice.auto_tts`` config default.
+
+        ``source`` is optional for older tests/callers; without it the method
+        keeps the historical chat-only behavior.
         """
-        if chat_id in self._auto_tts_enabled_chats:
+        chat_key = str(chat_id)
+        topic_key = None
+        if source is not None and getattr(source, "thread_id", None) is not None:
+            topic_key = f"{chat_key}:{source.thread_id}"
+
+        if topic_key and topic_key in self._auto_tts_disabled_chats:
+            return False
+        if topic_key and topic_key in self._auto_tts_enabled_chats:
             return True
-        if chat_id in self._auto_tts_disabled_chats:
+        if chat_key in self._auto_tts_enabled_chats:
+            return True
+        if chat_key in self._auto_tts_disabled_chats:
             return False
         return bool(self._auto_tts_default)
 
@@ -4302,7 +4315,17 @@ class BasePlatformAdapter(ABC):
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
                 # True globally and no ``/voice off`` has been issued.
                 _tts_path = None
-                if (self._should_auto_tts_for_chat(event.source.chat_id)
+                try:
+                    _should_voice_first_tts = self._should_auto_tts_for_chat(
+                        event.source.chat_id,
+                        event.source,
+                    )
+                except TypeError:
+                    # Some tests/plugins monkeypatch the gate with the original
+                    # one-argument shape. Keep that compatibility while the real
+                    # method remains source-aware for topic overrides.
+                    _should_voice_first_tts = self._should_auto_tts_for_chat(event.source.chat_id)
+                if (_should_voice_first_tts
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files):

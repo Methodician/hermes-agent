@@ -378,6 +378,25 @@ class TestGatewayNarrationMode:
         assert runner._should_send_voice_reply(_event(thread_id="1495"), "hello", []) is False
         assert runner._should_enqueue_narration(_event(thread_id="1495"), "hello", []) is True
 
+    def test_topic_narration_suppresses_base_auto_tts_but_still_enqueues_narration(self, runner, monkeypatch):
+        from gateway.config import Platform
+        from gateway.platforms.base import BasePlatformAdapter
+
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"voice": {"auto_tts": True}})
+        runner._voice_mode["telegram:123:1495"] = "narration"
+        adapter = SimpleNamespace(
+            _auto_tts_default=False,
+            _auto_tts_disabled_chats=set(),
+            _auto_tts_enabled_chats=set(),
+            platform=Platform.TELEGRAM,
+        )
+        runner._sync_voice_mode_state_to_adapter(adapter)
+        event = _event(thread_id="1495")
+        event.message_type = MessageType.VOICE
+
+        assert BasePlatformAdapter._should_auto_tts_for_chat(adapter, event.source.chat_id, event.source) is False
+        assert runner._should_enqueue_narration(event, "text first, then narrated", []) is True
+
     @pytest.mark.asyncio
     async def test_deferred_narration_registers_post_delivery_callback(self, runner):
         adapter = SimpleNamespace(
@@ -473,6 +492,43 @@ class TestGatewayNarrationMode:
         await runner._process_narration_job(job.job_id)
 
         assert seen == ["First.", "Second."]
+
+    @pytest.mark.asyncio
+    async def test_process_narration_job_redacts_skipped_media_only_chunk_on_completion(self, runner, monkeypatch):
+        calls = []
+
+        def fake_tts(text, output_path=None, provider=None):
+            calls.append(text)
+            return json.dumps({"success": False, "error": "should not run"})
+
+        monkeypatch.setattr("gateway.tts_narration.text_to_speech_tool", fake_tts)
+        adapter = SimpleNamespace(send_voice=AsyncMock(return_value=SendResult(success=True, message_id="sent")))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        private_media_text = "MEDIA:/tmp/private-file.png"
+        job = runner._tts_narration_store.enqueue_job(
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            reply_to_message_id="msg42",
+            idempotency_key="turn-media-only",
+            text=private_media_text,
+            chunks=[private_media_text],
+            provider="openrouter-coral",
+            model="openai/gpt-audio-mini",
+            voice="coral",
+            scope_key="telegram:123",
+            policy={"target_chars": 1000, "max_chars": 1200},
+        )
+
+        await runner._process_narration_job(job.job_id)
+
+        chunks = runner._tts_narration_store.list_chunks(job.job_id)
+        assert runner._tts_narration_store.get_job(job.job_id)["status"] == "complete"
+        assert chunks[0]["status"] == "skipped"
+        assert chunks[0]["text"] == ""
+        assert chunks[0]["text_sha256"] == __import__("hashlib").sha256(private_media_text.encode("utf-8")).hexdigest()
+        assert calls == []
+        adapter.send_voice.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_process_narration_job_preserves_stored_telegram_topic_metadata(self, runner, tmp_path, monkeypatch):
