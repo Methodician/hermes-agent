@@ -395,7 +395,7 @@ class NarrationJobStore:
                     """
                     UPDATE tts_narration_chunks
                        SET text = '', audio_path = NULL, updated_at = ?
-                     WHERE job_id = ? AND status = 'sent'
+                     WHERE job_id = ? AND status IN ('sent', 'skipped')
                     """,
                     (now, job_id),
                 )
