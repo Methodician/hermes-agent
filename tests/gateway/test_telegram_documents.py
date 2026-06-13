@@ -573,6 +573,28 @@ class TestSendVoice:
         connected_adapter._bot.send_audio.assert_awaited_once()
         connected_adapter._bot.send_document.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_native_voice_failure_does_not_fall_back_to_path_text(self, connected_adapter, tmp_path):
+        """A Telegram voice upload failure must not leak a local /tmp path as text."""
+        audio_file = tmp_path / "clip.ogg"
+        audio_file.write_bytes(b"OggS" + b"\x00" * 32)
+
+        connected_adapter._bot.send_voice = AsyncMock(side_effect=TimeoutError("upload timed out"))
+        connected_adapter._bot.send_audio = AsyncMock()
+        connected_adapter._bot.send_document = AsyncMock()
+        connected_adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="fallback-text"))
+
+        result = await connected_adapter.send_voice(
+            chat_id="12345",
+            audio_path=str(audio_file),
+        )
+
+        assert result.success is False
+        assert "upload timed out" in (result.error or "")
+        connected_adapter.send.assert_not_awaited()
+        connected_adapter._bot.send_document.assert_not_awaited()
+        connected_adapter._bot.send_audio.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # TestSendDocument — outbound file attachment delivery

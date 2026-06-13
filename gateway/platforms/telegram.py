@@ -4295,12 +4295,17 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.error(
-                "[%s] Failed to send Telegram voice/audio, falling back to base adapter: %s",
+                "[%s] Failed to send Telegram voice/audio: %s",
                 self.name,
                 e,
                 exc_info=True,
             )
-            return await super().send_voice(chat_id, audio_path, caption, reply_to, metadata=metadata)
+            # Do not fall back to BasePlatformAdapter.send_voice() here: that
+            # generic fallback sends plain text like ``🔊 Audio: /tmp/...``.
+            # For Telegram, a failed native upload should be reported as a
+            # delivery failure so callers can retry or mark the chunk failed
+            # without leaking transient local filesystem paths to the chat.
+            return SendResult(success=False, error=str(e) or e.__class__.__name__, retryable=True)
 
     async def send_multiple_images(
         self,
