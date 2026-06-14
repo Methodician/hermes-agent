@@ -334,6 +334,7 @@ class TestGatewayNarrationMode:
         runner._VOICE_MODE_PATH = tmp_path / "gateway_voice_mode.json"
         runner._TTS_NARRATION_DB_PATH = tmp_path / "narration.sqlite"
         runner._tts_narration_store = NarrationJobStore(runner._TTS_NARRATION_DB_PATH)
+        runner._background_tasks = set()
         runner._session_key_for_source = lambda source: "session-key"
         runner._reply_anchor_for_event = lambda event: getattr(event, "message_id", None)
         runner._thread_metadata_for_source = lambda source, reply_anchor=None: {
@@ -456,6 +457,38 @@ class TestGatewayNarrationMode:
         call = adapter.register_post_delivery_callback.call_args
         assert call.args[0] == "session-key"
         assert call.kwargs["generation"] == 7
+
+    @pytest.mark.asyncio
+    async def test_deferred_narration_callback_schedules_background_job_without_awaiting_it(self, runner, monkeypatch):
+        adapter = SimpleNamespace(
+            register_post_delivery_callback=MagicMock(),
+            _active_sessions={"session-key": SimpleNamespace(_hermes_run_generation=7)},
+        )
+        runner.adapters[Platform.TELEGRAM] = adapter
+        event = _event(thread_id="1495")
+        runner._voice_mode["telegram:123:1495"] = "narration"
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_process(job_id):
+            started.set()
+            await release.wait()
+
+        monkeypatch.setattr(runner, "_process_narration_job", slow_process)
+
+        await runner._defer_narration_after_delivery(event, "Narrate this in the background.")
+        callback = adapter.register_post_delivery_callback.call_args.args[1]
+        result = callback()
+        if asyncio.iscoroutine(result):
+            await result
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert len(runner._background_tasks) == 1
+        task = next(iter(runner._background_tasks))
+        assert not task.done()
+
+        release.set()
+        await asyncio.wait_for(task, timeout=1)
 
     @pytest.mark.asyncio
     async def test_process_narration_job_sends_chunks_in_order_and_records_success(self, runner, tmp_path, monkeypatch):

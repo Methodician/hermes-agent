@@ -10094,9 +10094,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _deliver() -> None:
             try:
                 job = self._enqueue_narration_job(event, response)
-                await self._process_narration_job(job.job_id)
             except Exception as exc:
-                logger.warning("Long-form narration delivery failed: %s", exc, exc_info=True)
+                logger.warning("Long-form narration enqueue failed: %s", exc, exc_info=True)
+                return
+
+            async def _run_narration_job() -> None:
+                try:
+                    await self._process_narration_job(job.job_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Long-form narration delivery failed: %s", exc, exc_info=True)
+
+            task = asyncio.create_task(_run_narration_job())
+            tasks = getattr(self, "_background_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._background_tasks = tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
 
         register = getattr(adapter, "register_post_delivery_callback", None)
         if callable(register):
