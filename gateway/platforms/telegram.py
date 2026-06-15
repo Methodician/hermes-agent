@@ -420,7 +420,12 @@ class TelegramAdapter(BasePlatformAdapter):
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
         # Bot API 10.1 Rich Messages: send final replies via sendRichMessage
-        # with the raw agent markdown so tables/task lists/etc. render natively.
+        # with raw agent markdown so tables/task lists/etc. can render natively.
+        # Telegram clients that do not yet implement Rich Messages show only
+        # "This message is not supported by your version of Telegram", even
+        # though the Bot API accepts the send. Keep the feature opt-in until
+        # client support is broadly reliable.
+        self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
         # Latched off after a capability failure on sendRichMessage /
         # sendRichMessageDraft (e.g. older python-telegram-bot without the
         # endpoint) so later sends skip the doomed rich attempt entirely.
@@ -948,7 +953,9 @@ class TelegramAdapter(BasePlatformAdapter):
         ``SimpleNamespace`` bots lack the attribute entirely — both resolve to
         ``False`` here, so the legacy path is used unchanged.
         """
-        return inspect.iscoroutinefunction(getattr(self._bot, "do_api_request", None))
+        return bool(self._rich_messages_enabled) and inspect.iscoroutinefunction(
+            getattr(self._bot, "do_api_request", None)
+        )
 
     def _should_attempt_rich(
         self, content: str, metadata: Optional[Dict[str, Any]] = None
