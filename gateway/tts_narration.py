@@ -401,6 +401,41 @@ class NarrationJobStore:
                 )
             conn.commit()
 
+    def set_job_provider_if_unset(
+        self,
+        job_id: str,
+        *,
+        provider: str,
+        model: Optional[str] = None,
+        voice: Optional[str] = None,
+    ) -> bool:
+        """Persist the selected narration provider before chunk synthesis.
+
+        The provider is sticky for the whole job. We only lock a provider when
+        the job has no provider yet and no chunk has already been sent, so a
+        retry can never silently switch narrator voices mid-job.
+        """
+        provider = str(provider or "").strip()
+        if not provider:
+            raise ValueError("provider is required")
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE tts_narration_jobs
+                   SET provider = ?, model = COALESCE(?, model), voice = COALESCE(?, voice),
+                       last_error = NULL
+                 WHERE job_id = ?
+                   AND provider IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM tts_narration_chunks
+                        WHERE job_id = ? AND status = 'sent'
+                   )
+                """,
+                (provider, model, voice, job_id, job_id),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+
     def recover_stale_processing(self, *, older_than_seconds: int = 900) -> int:
         """Move stale in-flight jobs/chunks back to retryable failed state.
 
@@ -498,54 +533,105 @@ class NarrationJobStore:
             conn.commit()
 
 
+def _clean_config_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def _provider_metadata_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    tts_cfg = cfg.get("tts") or {}
+    narration_cfg = (tts_cfg.get("narration") or {}) if isinstance(tts_cfg, dict) else {}
+    legacy_cfg = ((cfg.get("voice") or {}).get("long_form_tts") or {})
+    provider = (
+        narration_cfg.get("provider")
+        or narration_cfg.get("primary_provider")
+        or legacy_cfg.get("primary_provider")
+        or legacy_cfg.get("provider")
+    )
+    return {
+        "provider": _clean_config_string(provider),
+        "model": _clean_config_string(narration_cfg.get("model") or legacy_cfg.get("model")),
+        "voice": _clean_config_string(narration_cfg.get("voice") or legacy_cfg.get("voice")),
+    }
+
+
+def _configured_provider_metadata(cfg: Dict[str, Any], provider: str) -> Dict[str, Optional[str]]:
+    """Best-effort metadata for a named TTS provider, including custom names."""
+    tts_cfg = cfg.get("tts") or {}
+    provider_cfg = (tts_cfg.get(provider) or {}) if isinstance(tts_cfg, dict) else {}
+    if not provider_cfg and isinstance(tts_cfg, dict):
+        providers_cfg = tts_cfg.get("providers") or {}
+        if isinstance(providers_cfg, dict):
+            provider_cfg = providers_cfg.get(provider) or {}
+    if not isinstance(provider_cfg, dict):
+        provider_cfg = {}
+    return {
+        "provider": _clean_config_string(provider),
+        "model": _clean_config_string(provider_cfg.get("model") or provider_cfg.get("model_id")),
+        "voice": _clean_config_string(provider_cfg.get("voice") or provider_cfg.get("voice_id")),
+    }
+
+
+def narration_provider_chain_from_config() -> List[Dict[str, Optional[str]]]:
+    """Return the ordered provider fallback chain for sticky narration jobs.
+
+    ``tts.narration.fallback_providers`` is the authoritative ordered chain and
+    may contain built-in or custom command provider names. Without an explicit
+    chain, narration uses the explicit narration provider override if present,
+    otherwise the regular ``tts.provider``.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+    except Exception:
+        cfg = {}
+
+    tts_cfg = cfg.get("tts") or {}
+    narration_cfg = (tts_cfg.get("narration") or {}) if isinstance(tts_cfg, dict) else {}
+    raw_chain = narration_cfg.get("fallback_providers") if isinstance(narration_cfg, dict) else None
+    providers: List[str] = []
+    if isinstance(raw_chain, str):
+        providers = [p.strip() for p in raw_chain.split(",")]
+    elif isinstance(raw_chain, (list, tuple)):
+        providers = [str(p).strip() for p in raw_chain]
+
+    if not providers:
+        explicit = _provider_metadata_from_cfg(cfg).get("provider")
+        default = (tts_cfg.get("provider") if isinstance(tts_cfg, dict) else None) or "edge"
+        providers = [explicit or str(default).strip() or "edge"]
+
+    explicit_meta = _provider_metadata_from_cfg(cfg)
+    chain: List[Dict[str, Optional[str]]] = []
+    seen = set()
+    for provider in providers:
+        provider = _clean_config_string(provider)
+        if not provider or provider in seen:
+            continue
+        seen.add(provider)
+        meta = _configured_provider_metadata(cfg, provider)
+        if provider == explicit_meta.get("provider"):
+            meta["model"] = explicit_meta.get("model") or meta.get("model")
+            meta["voice"] = explicit_meta.get("voice") or meta.get("voice")
+        chain.append(meta)
+    return chain
+
+
 def provider_metadata_from_config() -> Dict[str, Optional[str]]:
     """Return optional long-form narration provider metadata.
 
     Narration defaults to the same provider resolution path as the regular
     ``text_to_speech`` tool: when no narration-specific override is configured,
-    ``provider`` is left as ``None`` so ``text_to_speech_tool`` uses
-    ``tts.provider`` and the matching provider config.  Users may override only
-    narration via either of these config shapes::
-
-        tts:
-          narration:
-            provider: openai
-            model: gpt-4o-mini-tts
-            voice: coral
-
-        voice:
-          long_form_tts:   # legacy/local prototype spelling
-            primary_provider: openai
-            model: gpt-4o-mini-tts
-            voice: coral
+    ``provider`` is left as ``None`` so enqueue stays provider-neutral. Users
+    may override only narration via ``tts.narration.provider`` or the legacy
+    ``voice.long_form_tts.primary_provider`` spelling.
     """
-    provider = None
-    model = None
-    voice = None
     try:
         from hermes_cli.config import load_config
-        cfg = load_config() or {}
-        tts_cfg = cfg.get("tts") or {}
-        narration_cfg = (tts_cfg.get("narration") or {}) if isinstance(tts_cfg, dict) else {}
-        legacy_cfg = ((cfg.get("voice") or {}).get("long_form_tts") or {})
-        provider = (
-            narration_cfg.get("provider")
-            or narration_cfg.get("primary_provider")
-            or legacy_cfg.get("primary_provider")
-            or legacy_cfg.get("provider")
-        )
-        model = narration_cfg.get("model") or legacy_cfg.get("model")
-        voice = narration_cfg.get("voice") or legacy_cfg.get("voice")
+        return _provider_metadata_from_cfg(load_config() or {})
     except Exception:
-        pass
-
-    def clean(value):
-        if value is None:
-            return None
-        value = str(value).strip()
-        return value or None
-
-    return {"provider": clean(provider), "model": clean(model), "voice": clean(voice)}
+        return {"provider": None, "model": None, "voice": None}
 
 
 def sanitize_error(error: Any) -> str:
@@ -559,3 +645,33 @@ def narration_audio_path(job_id: str, chunk_index: int) -> str:
     out_dir = Path(tempfile.gettempdir()) / "hermes_voice" / "narration"
     out_dir.mkdir(parents=True, exist_ok=True)
     return str(out_dir / f"{job_id}_{chunk_index:03d}.ogg")
+
+
+def preflight_narration_provider(provider: str) -> tuple[bool, Optional[str]]:
+    """Run a tiny real TTS synthesis to prove a provider is usable.
+
+    The sample text is fixed and short so operational logs do not capture any
+    private narration content. This is synthesis-only; Telegram delivery errors
+    are handled later and never trigger provider fallback.
+    """
+    provider = str(provider or "").strip()
+    if not provider:
+        return False, "empty provider"
+    output_path = narration_audio_path(f"preflight-{uuid.uuid4().hex}", 1)
+    try:
+        result_json = text_to_speech_tool(
+            text="Brief narration provider preflight.",
+            output_path=output_path,
+            provider=provider,
+        )
+        result = json.loads(result_json) if isinstance(result_json, str) else (result_json or {})
+        actual_path = result.get("file_path") or output_path
+        if result.get("success") and os.path.isfile(actual_path):
+            try:
+                os.remove(actual_path)
+            except OSError:
+                pass
+            return True, None
+        return False, sanitize_error(result.get("error") or "TTS preflight failed")
+    except Exception as exc:
+        return False, sanitize_error(exc)

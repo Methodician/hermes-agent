@@ -1610,6 +1610,13 @@ DEFAULT_CONFIG = {
     # Gemini 32000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS 2000).
     "tts": {
         "provider": "edge",  # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "neutts" (local) | "kittentts" (local) | "piper" (local)
+        "narration": {
+            # Optional ordered synthesis fallback chain for long-form narration.
+            # Provider names may be built-in providers or custom command providers
+            # from tts.providers.<name>. The first provider that passes preflight
+            # is locked for the whole narration job.
+            "fallback_providers": [],
+        },
         "edge": {
             "voice": "en-US-AriaNeural",
             # Popular: AriaNeural, JennyNeural, AndrewNeural, BrianNeural, SoniaNeural

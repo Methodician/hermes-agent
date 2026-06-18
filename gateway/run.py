@@ -10152,7 +10152,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _process_narration_job(self, job_id: str) -> None:
         """Generate and send queued narration chunks in order, stopping on failure."""
-        from gateway.tts_narration import narration_audio_path, sanitize_error, text_to_speech_tool
+        from gateway.tts_narration import (
+            narration_audio_path,
+            narration_provider_chain_from_config,
+            preflight_narration_provider,
+            sanitize_error,
+            text_to_speech_tool,
+        )
 
         store = self._get_tts_narration_store()
         try:
@@ -10180,6 +10186,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not adapter or not hasattr(adapter, "send_voice"):
             store.update_job_status(job_id, "failed", last_error="voice delivery unavailable")
             return
+
+        if not job.get("provider"):
+            chain = narration_provider_chain_from_config()
+            failures = []
+            selected = None
+            for meta in chain:
+                provider = meta.get("provider")
+                if not provider:
+                    continue
+                ok, error = await asyncio.to_thread(preflight_narration_provider, provider)
+                if ok:
+                    selected = meta
+                    break
+                failures.append(f"{provider}: {error or 'preflight failed'}")
+            if not selected:
+                safe_error = sanitize_error(
+                    "narration provider preflight failed: " + "; ".join(failures or ["no providers configured"])
+                )
+                store.update_job_status(job_id, "failed", last_error=safe_error)
+                return
+            selected_provider = selected.get("provider")
+            if not selected_provider or not store.set_job_provider_if_unset(
+                job_id,
+                provider=selected_provider,
+                model=selected.get("model"),
+                voice=selected.get("voice"),
+            ):
+                job = store.get_job(job_id) or {}
+                if not job.get("provider"):
+                    store.update_job_status(job_id, "failed", last_error="provider lock unavailable after sent chunks")
+                    return
+            job = store.get_job(job_id)
+            if not job:
+                return
 
         chunks = store.list_chunks(job_id)
         active_chunk_index = None

@@ -98,6 +98,34 @@ class TestNarrationProviderMetadata:
             "voice": "coral",
         }
 
+    def test_narration_fallback_provider_chain_preserves_order_and_custom_names(self, monkeypatch):
+        from gateway import tts_narration
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "tts": {
+                    "provider": "edge",
+                    "narration": {
+                        "fallback_providers": ["openrouter-coral", "edge", "openrouter-coral"],
+                    },
+                    "providers": {
+                        "openrouter-coral": {
+                            "type": "command",
+                            "model": "openai/gpt-audio-mini",
+                            "voice": "coral",
+                        }
+                    },
+                    "edge": {"voice": "en-US-AvaMultilingualNeural"},
+                }
+            },
+        )
+
+        assert tts_narration.narration_provider_chain_from_config() == [
+            {"provider": "openrouter-coral", "model": "openai/gpt-audio-mini", "voice": "coral"},
+            {"provider": "edge", "model": None, "voice": "en-US-AvaMultilingualNeural"},
+        ]
+
 
 class TestNarrationStore:
     def test_enqueue_persists_job_and_chunks_without_full_text_in_job_row(self, tmp_path):
@@ -150,6 +178,53 @@ class TestNarrationStore:
 
         loaded = store.get_job(job.job_id)
         assert loaded["provider"] is None
+
+    def test_set_job_provider_if_unset_locks_provider_once_and_never_after_sent_chunk(self, tmp_path):
+        from gateway.tts_narration import NarrationJobStore
+
+        store = NarrationJobStore(tmp_path / "narration.sqlite")
+        job = store.enqueue_job(
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            reply_to_message_id="msg42",
+            idempotency_key="provider-lock",
+            text="First. Second.",
+            chunks=["First.", "Second."],
+            provider=None,
+            model=None,
+            voice=None,
+            scope_key="telegram:123",
+            policy={"target_chars": 1000, "max_chars": 1200},
+        )
+
+        assert store.set_job_provider_if_unset(
+            job.job_id,
+            provider="openrouter-coral",
+            model="openai/gpt-audio-mini",
+            voice="coral",
+        ) is True
+        assert store.get_job(job.job_id)["provider"] == "openrouter-coral"
+        assert store.set_job_provider_if_unset(job.job_id, provider="edge") is False
+        assert store.get_job(job.job_id)["provider"] == "openrouter-coral"
+
+        sent_job = store.enqueue_job(
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            reply_to_message_id="msg43",
+            idempotency_key="provider-lock-sent",
+            text="Already sent.",
+            chunks=["Already sent."],
+            provider=None,
+            model=None,
+            voice=None,
+            scope_key="telegram:123",
+            policy={"target_chars": 1000, "max_chars": 1200},
+        )
+        store.update_chunk(sent_job.job_id, 1, status="sent")
+        assert store.set_job_provider_if_unset(sent_job.job_id, provider="edge") is False
+        assert store.get_job(sent_job.job_id)["provider"] is None
 
     def test_init_migrates_legacy_provider_not_null_schema(self, tmp_path):
         from gateway.tts_narration import NarrationJobStore
@@ -568,6 +643,197 @@ class TestGatewayNarrationMode:
         await runner._process_narration_job(job.job_id)
 
         assert seen == ["First.", "Second."]
+
+    @pytest.mark.asyncio
+    async def test_process_narration_job_preflights_and_locks_primary_provider_for_unset_job(
+        self, runner, tmp_path, monkeypatch
+    ):
+        calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "tts": {
+                    "provider": "edge",
+                    "narration": {"fallback_providers": ["openrouter-coral", "edge"]},
+                    "providers": {"openrouter-coral": {"model": "openai/gpt-audio-mini", "voice": "coral"}},
+                }
+            },
+        )
+
+        def fake_tts(text, output_path=None, provider=None):
+            calls.append((text, provider))
+            path = tmp_path / f"{len(calls)}.ogg"
+            path.write_bytes(b"OggS fake")
+            return json.dumps({"success": True, "file_path": str(path), "provider": provider})
+
+        monkeypatch.setattr("gateway.tts_narration.text_to_speech_tool", fake_tts)
+        adapter = SimpleNamespace(send_voice=AsyncMock(return_value=SendResult(success=True, message_id="sent")))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        job = runner._tts_narration_store.enqueue_job(
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            reply_to_message_id="msg42",
+            idempotency_key="turn-primary-preflight",
+            text="First. Second.",
+            chunks=["First.", "Second."],
+            provider=None,
+            model=None,
+            voice=None,
+            scope_key="telegram:123",
+            policy={"target_chars": 1000, "max_chars": 1200},
+        )
+
+        await runner._process_narration_job(job.job_id)
+
+        assert calls == [
+            ("Brief narration provider preflight.", "openrouter-coral"),
+            ("First.", "openrouter-coral"),
+            ("Second.", "openrouter-coral"),
+        ]
+        loaded = runner._tts_narration_store.get_job(job.job_id)
+        assert loaded["provider"] == "openrouter-coral"
+        assert loaded["model"] == "openai/gpt-audio-mini"
+        assert loaded["voice"] == "coral"
+        assert loaded["status"] == "complete"
+
+    @pytest.mark.asyncio
+    async def test_process_narration_job_falls_back_to_edge_before_any_chunk_synthesis(
+        self, runner, tmp_path, monkeypatch
+    ):
+        calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tts": {"provider": "edge", "narration": {"fallback_providers": ["openrouter-coral", "edge"]}}},
+        )
+
+        def fake_tts(text, output_path=None, provider=None):
+            calls.append((text, provider))
+            if provider == "openrouter-coral":
+                return json.dumps({"success": False, "error": "provider unavailable"})
+            path = tmp_path / f"{len(calls)}.ogg"
+            path.write_bytes(b"OggS fake")
+            return json.dumps({"success": True, "file_path": str(path), "provider": provider})
+
+        monkeypatch.setattr("gateway.tts_narration.text_to_speech_tool", fake_tts)
+        adapter = SimpleNamespace(send_voice=AsyncMock(return_value=SendResult(success=True, message_id="sent")))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        job = runner._tts_narration_store.enqueue_job(
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            reply_to_message_id="msg42",
+            idempotency_key="turn-edge-fallback",
+            text="First. Second.",
+            chunks=["First.", "Second."],
+            provider=None,
+            model=None,
+            voice=None,
+            scope_key="telegram:123",
+            policy={"target_chars": 1000, "max_chars": 1200},
+        )
+
+        await runner._process_narration_job(job.job_id)
+
+        assert calls == [
+            ("Brief narration provider preflight.", "openrouter-coral"),
+            ("Brief narration provider preflight.", "edge"),
+            ("First.", "edge"),
+            ("Second.", "edge"),
+        ]
+        assert runner._tts_narration_store.get_job(job.job_id)["provider"] == "edge"
+        assert [c["status"] for c in runner._tts_narration_store.list_chunks(job.job_id)] == ["sent", "sent"]
+
+    @pytest.mark.asyncio
+    async def test_process_narration_job_all_preflights_fail_before_chunks_or_send(
+        self, runner, monkeypatch
+    ):
+        calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tts": {"provider": "edge", "narration": {"fallback_providers": ["openrouter-coral", "edge"]}}},
+        )
+
+        def fake_tts(text, output_path=None, provider=None):
+            calls.append((text, provider))
+            return json.dumps({"success": False, "error": "provider unavailable"})
+
+        monkeypatch.setattr("gateway.tts_narration.text_to_speech_tool", fake_tts)
+        adapter = SimpleNamespace(send_voice=AsyncMock(return_value=SendResult(success=True, message_id="sent")))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        job = runner._tts_narration_store.enqueue_job(
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            reply_to_message_id="msg42",
+            idempotency_key="turn-all-preflight-fail",
+            text="First. Second.",
+            chunks=["First.", "Second."],
+            provider=None,
+            model=None,
+            voice=None,
+            scope_key="telegram:123",
+            policy={"target_chars": 1000, "max_chars": 1200},
+        )
+
+        await runner._process_narration_job(job.job_id)
+
+        assert calls == [
+            ("Brief narration provider preflight.", "openrouter-coral"),
+            ("Brief narration provider preflight.", "edge"),
+        ]
+        adapter.send_voice.assert_not_awaited()
+        assert [c["status"] for c in runner._tts_narration_store.list_chunks(job.job_id)] == ["queued", "queued"]
+        loaded = runner._tts_narration_store.get_job(job.job_id)
+        assert loaded["status"] == "failed"
+        assert "preflight" in (loaded["last_error"] or "")
+
+    @pytest.mark.asyncio
+    async def test_process_narration_job_does_not_fallback_after_telegram_send_failure(
+        self, runner, tmp_path, monkeypatch
+    ):
+        calls = []
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"tts": {"provider": "edge", "narration": {"fallback_providers": ["openrouter-coral", "edge"]}}},
+        )
+
+        def fake_tts(text, output_path=None, provider=None):
+            calls.append((text, provider))
+            path = tmp_path / f"{len(calls)}.ogg"
+            path.write_bytes(b"OggS fake")
+            return json.dumps({"success": True, "file_path": str(path), "provider": provider})
+
+        monkeypatch.setattr("gateway.tts_narration.text_to_speech_tool", fake_tts)
+        adapter = SimpleNamespace(send_voice=AsyncMock(return_value=SendResult(success=False, error="telegram failed")))
+        runner.adapters[Platform.TELEGRAM] = adapter
+        job = runner._tts_narration_store.enqueue_job(
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            reply_to_message_id="msg42",
+            idempotency_key="turn-send-fail-no-provider-fallback",
+            text="First. Second.",
+            chunks=["First.", "Second."],
+            provider=None,
+            model=None,
+            voice=None,
+            scope_key="telegram:123",
+            policy={"target_chars": 1000, "max_chars": 1200},
+        )
+
+        await runner._process_narration_job(job.job_id)
+
+        assert calls == [
+            ("Brief narration provider preflight.", "openrouter-coral"),
+            ("First.", "openrouter-coral"),
+        ]
+        assert runner._tts_narration_store.get_job(job.job_id)["provider"] == "openrouter-coral"
+        assert [c["status"] for c in runner._tts_narration_store.list_chunks(job.job_id)] == ["failed", "queued"]
 
     @pytest.mark.asyncio
     async def test_process_narration_job_redacts_skipped_media_only_chunk_on_completion(self, runner, monkeypatch):
