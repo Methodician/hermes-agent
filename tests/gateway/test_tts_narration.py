@@ -126,6 +126,27 @@ class TestNarrationProviderMetadata:
             {"provider": "edge", "model": None, "voice": "en-US-AvaMultilingualNeural"},
         ]
 
+    def test_fallback_provider_chain_keeps_new_jobs_provider_neutral(self, monkeypatch):
+        from gateway import tts_narration
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "tts": {
+                    "narration": {
+                        "provider": "openrouter-coral",
+                        "fallback_providers": ["openrouter-coral", "edge"],
+                    }
+                }
+            },
+        )
+
+        assert tts_narration.provider_metadata_from_config() == {
+            "provider": None,
+            "model": None,
+            "voice": None,
+        }
+
 
 class TestNarrationStore:
     def test_enqueue_persists_job_and_chunks_without_full_text_in_job_row(self, tmp_path):
@@ -515,6 +536,27 @@ class TestGatewayNarrationMode:
 
         assert BasePlatformAdapter._should_auto_tts_for_chat(adapter, event.source.chat_id, event.source) is False
         assert runner._should_enqueue_narration(event, "text first, then narrated", []) is True
+
+    def test_enqueue_keeps_provider_unset_when_fallback_chain_is_configured(self, runner, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "tts": {
+                    "narration": {
+                        "provider": "openrouter-coral",
+                        "fallback_providers": ["openrouter-coral", "edge"],
+                    }
+                }
+            },
+        )
+        runner._voice_mode["telegram:123:1495"] = "narration"
+
+        job = runner._enqueue_narration_job(_event(thread_id="1495"), "First. Second.")
+
+        loaded = runner._tts_narration_store.get_job(job.job_id)
+        assert loaded["provider"] is None
+        assert loaded["model"] is None
+        assert loaded["voice"] is None
 
     @pytest.mark.asyncio
     async def test_deferred_narration_registers_post_delivery_callback(self, runner):

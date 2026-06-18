@@ -2071,6 +2071,8 @@ def text_to_speech_tool(
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
     want_opus = (platform == "telegram")
 
+    explicit_opus_output: Optional[str] = None
+
     # Determine output path
     if output_path:
         # Reject '..' traversal components in the user-supplied path. An
@@ -2092,6 +2094,17 @@ def text_to_speech_tool(
                 ),
             }, ensure_ascii=False)
         file_path = Path(output_path).expanduser()
+        if (
+            provider == "edge"
+            and file_path.suffix.lower() in {".ogg", ".opus"}
+        ):
+            # Edge TTS always writes MP3 bytes. If a caller asks for an Opus
+            # path (the narration pipeline does this for Telegram), synthesize
+            # to a temporary MP3 sibling first so the conversion step can either
+            # return the requested .ogg voice file or fall back honestly to an
+            # .mp3 audio file instead of disguising MP3 bytes as .ogg.
+            explicit_opus_output = str(file_path)
+            file_path = file_path.with_suffix(".mp3")
         if command_provider_config is not None:
             # Respect caller-supplied path but align the extension with the
             # provider's configured output_format so the command writes to a
@@ -2288,13 +2301,17 @@ def text_to_speech_tool(
                         file_str = opus_path
                 voice_compatible = file_str.endswith(".ogg")
         elif (
-            want_opus
+            (want_opus or explicit_opus_output is not None)
             and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
-            and not file_str.endswith(".ogg")
+            and (explicit_opus_output is not None or not file_str.endswith(".ogg"))
         ):
             opus_path = _convert_to_opus(file_str)
             if opus_path:
-                file_str = opus_path
+                if explicit_opus_output and opus_path != explicit_opus_output:
+                    Path(opus_path).replace(explicit_opus_output)
+                    file_str = explicit_opus_output
+                else:
+                    file_str = opus_path
                 voice_compatible = True
         elif provider in {"elevenlabs", "openai", "mistral", "gemini"}:
             voice_compatible = want_opus and file_str.endswith(".ogg")

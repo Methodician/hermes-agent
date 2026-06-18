@@ -557,6 +557,17 @@ def _provider_metadata_from_cfg(cfg: Dict[str, Any]) -> Dict[str, Optional[str]]
     }
 
 
+def _fallback_provider_names_from_cfg(cfg: Dict[str, Any]) -> List[str]:
+    tts_cfg = cfg.get("tts") or {}
+    narration_cfg = (tts_cfg.get("narration") or {}) if isinstance(tts_cfg, dict) else {}
+    raw_chain = narration_cfg.get("fallback_providers") if isinstance(narration_cfg, dict) else None
+    if isinstance(raw_chain, str):
+        return [p.strip() for p in raw_chain.split(",") if p.strip()]
+    if isinstance(raw_chain, (list, tuple)):
+        return [str(p).strip() for p in raw_chain if str(p).strip()]
+    return []
+
+
 def _configured_provider_metadata(cfg: Dict[str, Any], provider: str) -> Dict[str, Optional[str]]:
     """Best-effort metadata for a named TTS provider, including custom names."""
     tts_cfg = cfg.get("tts") or {}
@@ -589,13 +600,7 @@ def narration_provider_chain_from_config() -> List[Dict[str, Optional[str]]]:
         cfg = {}
 
     tts_cfg = cfg.get("tts") or {}
-    narration_cfg = (tts_cfg.get("narration") or {}) if isinstance(tts_cfg, dict) else {}
-    raw_chain = narration_cfg.get("fallback_providers") if isinstance(narration_cfg, dict) else None
-    providers: List[str] = []
-    if isinstance(raw_chain, str):
-        providers = [p.strip() for p in raw_chain.split(",")]
-    elif isinstance(raw_chain, (list, tuple)):
-        providers = [str(p).strip() for p in raw_chain]
+    providers = _fallback_provider_names_from_cfg(cfg)
 
     if not providers:
         explicit = _provider_metadata_from_cfg(cfg).get("provider")
@@ -623,13 +628,19 @@ def provider_metadata_from_config() -> Dict[str, Optional[str]]:
 
     Narration defaults to the same provider resolution path as the regular
     ``text_to_speech`` tool: when no narration-specific override is configured,
-    ``provider`` is left as ``None`` so enqueue stays provider-neutral. Users
-    may override only narration via ``tts.narration.provider`` or the legacy
+    ``provider`` is left as ``None`` so enqueue stays provider-neutral. When
+    ``tts.narration.fallback_providers`` is configured, new jobs also stay
+    provider-neutral so processing can preflight and lock the first healthy
+    provider from that authoritative chain. Without a fallback chain, users may
+    still override only narration via ``tts.narration.provider`` or the legacy
     ``voice.long_form_tts.primary_provider`` spelling.
     """
     try:
         from hermes_cli.config import load_config
-        return _provider_metadata_from_cfg(load_config() or {})
+        cfg = load_config() or {}
+        if _fallback_provider_names_from_cfg(cfg):
+            return {"provider": None, "model": None, "voice": None}
+        return _provider_metadata_from_cfg(cfg)
     except Exception:
         return {"provider": None, "model": None, "voice": None}
 
