@@ -4107,9 +4107,13 @@ def run_conversation(
                 # Reset retry counter/signature on successful content
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
-                # Successful content reached — drop any buffered retry
-                # status from earlier failed attempts in this turn.
-                agent._clear_status_buffer()
+                # Successful content reached — surface fallback notices
+                # if a fallback model handled this turn, otherwise drop
+                # buffered retry status from transient primary recoveries.
+                if getattr(agent, '_fallback_activated', False):
+                    agent._flush_status_buffer()
+                else:
+                    agent._clear_status_buffer()
 
                 if (
                     agent.api_mode == "codex_responses"
