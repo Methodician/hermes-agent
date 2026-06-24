@@ -221,11 +221,19 @@ def finalize_turn(
     # every platform (Telegram, CLI, TUI, API) reliably delivers.  This does
     # not touch stored conversation history (the assistant message was already
     # appended upstream), so the cached prompt prefix is unaffected.
+    #
+    # The notice changes ``final_response`` *after* streaming has already sent
+    # the raw model text, so we must flag the final text as modified
+    # (``_response_transformed`` below) — otherwise the gateway treats the turn
+    # as already-delivered and suppresses the post-stream edit, dropping the
+    # notice on streamed platforms like Telegram (#51573).
+    _fallback_notice_injected = False
     if final_response and not interrupted:
         try:
             _fb_notice = agent._format_fallback_notice()
             if _fb_notice:
                 final_response = _fb_notice + "\n\n" + final_response.lstrip()
+                _fallback_notice_injected = True
         except Exception as _fb_err:
             logger.debug("fallback visibility notice failed: %s", _fb_err)
 
@@ -278,7 +286,11 @@ def finalize_turn(
         except Exception as _exp_err:
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
-    _response_transformed = False
+    # Seed with the fallback-notice injection so the gateway delivers the
+    # modified final text after streaming (see note above).  A later plugin
+    # transform sets this too; either way the notice is part of the single
+    # final text, so there is no duplicate delivery.
+    _response_transformed = _fallback_notice_injected
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.

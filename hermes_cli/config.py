@@ -809,6 +809,11 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # When the primary model/provider fails and a configured fallback serves
+    # the turn, prepend a one-line notice to the response so the user always
+    # knows which model actually answered (#51573).  Set to false to keep
+    # silent fallbacks.
+    "notify_on_fallback": True,
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
