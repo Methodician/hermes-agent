@@ -211,6 +211,24 @@ def finalize_turn(
         except Exception as _ver_err:
             logger.debug("file-mutation verifier footer failed: %s", _ver_err)
 
+    # Fallback visibility notice.
+    # When the primary model/provider failed and this turn was served by a
+    # configured fallback, the user otherwise sees a normal-looking response
+    # with no indication it came from a different backend (#51573).  The
+    # status-buffer pipeline (_emit_status → status_callback("lifecycle")) is
+    # not wired to user-visible channels on every platform, so we surface the
+    # notice by prepending it to the returned response text — the one channel
+    # every platform (Telegram, CLI, TUI, API) reliably delivers.  This does
+    # not touch stored conversation history (the assistant message was already
+    # appended upstream), so the cached prompt prefix is unaffected.
+    if final_response and not interrupted:
+        try:
+            _fb_notice = agent._format_fallback_notice()
+            if _fb_notice:
+                final_response = _fb_notice + "\n\n" + final_response.lstrip()
+        except Exception as _fb_err:
+            logger.debug("fallback visibility notice failed: %s", _fb_err)
+
     # Turn-completion explainer.
     # When a turn ends abnormally after substantive work — empty content
     # after retries, a partial/truncated stream, a still-pending tool

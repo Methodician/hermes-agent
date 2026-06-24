@@ -787,6 +787,42 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
 
+    def _format_fallback_notice(self) -> Optional[str]:
+        """Return a user-visible fallback notice for the just-finished turn.
+
+        Returns ``None`` when notifications are disabled, no fallback is
+        active, or the active runtime still matches the originally-requested
+        primary.  Otherwise returns a single line naming the requested model
+        and the model that actually responded.
+
+        Detection is stateless: it compares the live ``model``/``provider``
+        against ``_primary_runtime`` (the originally-requested route captured
+        at init / after an explicit ``switch_model``).  This survives the
+        status-buffer being cleared on successful recovery — the notice is
+        derived from runtime state, not from buffered retry chatter.
+        """
+        try:
+            if not getattr(self, "_notify_on_fallback", True):
+                return None
+            primary = getattr(self, "_primary_runtime", None) or {}
+            req_model = primary.get("model")
+            req_provider = primary.get("provider")
+            if not req_model:
+                return None
+            cur_model = getattr(self, "model", None)
+            cur_provider = getattr(self, "provider", None)
+            # Same model+provider as requested → no fallback in effect.
+            if cur_model == req_model and cur_provider == req_provider:
+                return None
+            req_label = f"{req_model} ({req_provider})" if req_provider else str(req_model)
+            cur_label = f"{cur_model} ({cur_provider})" if cur_provider else str(cur_model)
+            return (
+                f"⚠️ {req_label} unavailable — responded using {cur_label} instead."
+            )
+        except Exception:
+            logger.debug("fallback notice formatting failed", exc_info=True)
+            return None
+
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning through the same status plumbing.
 
