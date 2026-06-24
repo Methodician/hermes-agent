@@ -1090,6 +1090,17 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+
+    # Fallback visibility — when the primary model/provider fails and the
+    # turn is served by a configured fallback, surface a user-visible notice
+    # so quota/identity are never silently masked.  Default ON; disable with
+    # ``notify_on_fallback: false`` in config.yaml.
+    try:
+        _notify_fb = _agent_cfg.get("notify_on_fallback", True)
+        agent._notify_on_fallback = False if _notify_fb is False else True
+    except Exception:
+        agent._notify_on_fallback = True
+
     try:
         agent._tool_guardrails = ToolCallGuardrailController(
             ToolCallGuardrailConfig.from_mapping(
