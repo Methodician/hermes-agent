@@ -4108,9 +4108,15 @@ def run_conversation(
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
                 # Successful content reached — surface fallback notices
-                # if a fallback model handled this turn, otherwise drop
-                # buffered retry status from transient primary recoveries.
-                if getattr(agent, '_fallback_activated', False):
+                # if the active provider/model differs from the primary,
+                # otherwise drop buffered retry noise from transient
+                # primary recoveries.
+                primary = getattr(agent, '_primary_runtime', {}) or {}
+                on_fallback = (
+                    primary.get('model') != agent.model
+                    or primary.get('provider') != agent.provider
+                )
+                if on_fallback:
                     agent._flush_status_buffer()
                 else:
                     agent._clear_status_buffer()
