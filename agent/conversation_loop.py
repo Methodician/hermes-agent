@@ -4116,7 +4116,7 @@ def run_conversation(
                     primary.get('model') != agent.model
                     or primary.get('provider') != agent.provider
                 )
-                logger.debug(
+                logger.info(
                     "FALLBACK-CHECK: primary=%s/%s current=%s/%s on_fallback=%s buf_len=%d",
                     primary.get('model'), primary.get('provider'),
                     agent.model, agent.provider,
