@@ -48,6 +48,17 @@ logger = logging.getLogger("gateway.run")
 class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
+    def _apply_source_model_defaults(
+        self,
+        source,
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        strict: bool = True,
+    ) -> tuple:
+        """Runner hook: resolve per-source default model/runtime overrides."""
+        raise NotImplementedError
+
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
@@ -990,13 +1001,27 @@ class GatewaySlashCommandsMixin:
         except Exception:
             pass
 
-        # Check for session override
+        # Check for source/topic defaults and session override
         source = event.source
         # Normalize the source the same way a normal message turn does
         # (Telegram DM topic recovery) before deriving the override key, so
         # the override is stored under the key the next message turn reads
         # (#30479).
         source = self._normalize_source_for_session_key(source)
+        current_model, current_runtime = self._apply_source_model_defaults(
+            source,
+            current_model,
+            {
+                "provider": current_provider,
+                "api_key": current_api_key,
+                "base_url": current_base_url,
+            },
+            strict=False,
+        )
+        current_provider = current_runtime.get("provider", current_provider)
+        current_api_key = current_runtime.get("api_key", current_api_key)
+        current_base_url = current_runtime.get("base_url", current_base_url)
+
         session_key = self._session_key_for_source(source)
         override = self._session_model_overrides.get(session_key, {})
         if override:

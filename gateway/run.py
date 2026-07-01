@@ -2841,10 +2841,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         (provider/api_key/base_url/api_mode), prefer it directly instead of
         resolving fresh global runtime state first.
         """
-        resolved_session_key = session_key
-        if not resolved_session_key and source is not None:
+        resolved_source = source
+        if resolved_source is not None:
             try:
-                resolved_session_key = self._session_key_for_source(source)
+                resolved_source = self._normalize_source_for_session_key(resolved_source)
+            except Exception:
+                resolved_source = source
+
+        resolved_session_key = session_key
+        if not resolved_session_key and resolved_source is not None:
+            try:
+                resolved_session_key = self._session_key_for_source(resolved_source)
             except Exception:
                 resolved_session_key = None
 
@@ -2888,6 +2895,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime_model,
             )
             model = runtime_model
+        if resolved_source is not None:
+            model, runtime_kwargs = self._apply_source_model_defaults(
+                resolved_source, model, runtime_kwargs
+            )
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -12764,6 +12775,145 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=str,
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+    def _configured_model_defaults_for_source(
+        self,
+        source: Optional[SessionSource],
+    ) -> dict:
+        """Return per-topic model defaults configured for ``source``.
+
+        Today this supports Telegram ``group_topics`` and ``dm_topics`` entries,
+        allowing a topic to declare a default ``model`` plus optional runtime
+        hints like ``provider`` / ``base_url`` / ``api_mode``. Session-scoped
+        ``/model`` overrides still win later; this only provides the configured
+        baseline for that topic.
+        """
+        if source is None or getattr(source, "platform", None) != Platform.TELEGRAM:
+            return {}
+
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        thread_id = str(getattr(source, "thread_id", "") or "").strip()
+        if not chat_id or not thread_id:
+            return {}
+
+        config = getattr(self, "config", None)
+        platforms = getattr(config, "platforms", None) if config is not None else None
+        platform_cfg = None
+        if isinstance(platforms, dict):
+            platform_cfg = platforms.get(Platform.TELEGRAM) or platforms.get("telegram")
+        if platform_cfg is None:
+            adapters = getattr(self, "adapters", None)
+            if isinstance(adapters, dict):
+                adapter = adapters.get(Platform.TELEGRAM) or adapters.get("telegram")
+                platform_cfg = getattr(adapter, "config", None)
+
+        extra = getattr(platform_cfg, "extra", None)
+        if not isinstance(extra, dict):
+            return {}
+
+        chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
+        topics_key = None
+        if chat_type == "dm":
+            topics_key = "dm_topics"
+        elif chat_type == "group":
+            topics_key = "group_topics"
+        if not topics_key:
+            return {}
+
+        topic_groups = extra.get(topics_key)
+        if not isinstance(topic_groups, list):
+            return {}
+
+        for chat_entry in topic_groups:
+            if not isinstance(chat_entry, dict):
+                continue
+            if str(chat_entry.get("chat_id", "") or "").strip() != chat_id:
+                continue
+            topics = chat_entry.get("topics")
+            if not isinstance(topics, list):
+                continue
+            for topic in topics:
+                if not isinstance(topic, dict):
+                    continue
+                tid = topic.get("thread_id")
+                if tid is None or str(tid).strip() != thread_id:
+                    continue
+                result = {}
+                for key in ("model", "provider", "base_url", "api_mode"):
+                    value = topic.get(key)
+                    if isinstance(value, str):
+                        value = value.strip()
+                    if value not in (None, ""):
+                        result[key] = value
+                return result
+        return {}
+
+    def _apply_source_model_defaults(
+        self,
+        source: Optional[SessionSource],
+        model: str,
+        runtime_kwargs: dict,
+        *,
+        strict: bool = True,
+    ) -> tuple:
+        """Apply configured per-source model defaults, returning ``(model, runtime)``.
+
+        ``strict=True`` is used for real turns: a broken topic-level provider
+        override should fail loudly instead of silently falling back to the
+        wrong provider. ``strict=False`` lets informational commands like
+        ``/model`` keep working even if a topic default is half-configured.
+        """
+        override = self._configured_model_defaults_for_source(source)
+        if not override:
+            return model, runtime_kwargs
+
+        resolved_model = override.get("model", model) or model
+        resolved_runtime = dict(runtime_kwargs or {})
+
+        requested_provider = str(override.get("provider", "") or "").strip()
+        explicit_base_url = str(override.get("base_url", "") or "").strip()
+        explicit_api_mode = str(override.get("api_mode", "") or "").strip()
+
+        if requested_provider or explicit_base_url:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                topic_runtime = resolve_runtime_provider(
+                    requested=requested_provider or None,
+                    explicit_base_url=explicit_base_url or None,
+                )
+            except Exception as exc:
+                if strict:
+                    raise
+                logger.warning(
+                    "Failed to resolve configured topic runtime override for %s/%s thread=%s: %s",
+                    getattr(source, "platform", None),
+                    getattr(source, "chat_id", None),
+                    getattr(source, "thread_id", None),
+                    exc,
+                )
+                topic_runtime = None
+
+            if topic_runtime:
+                for key in (
+                    "provider",
+                    "api_key",
+                    "base_url",
+                    "api_mode",
+                    "command",
+                    "args",
+                    "credential_pool",
+                ):
+                    value = topic_runtime.get(key)
+                    if value is not None:
+                        resolved_runtime[key] = value
+                if not resolved_model and topic_runtime.get("model"):
+                    resolved_model = topic_runtime["model"]
+
+        if explicit_api_mode:
+            resolved_runtime["api_mode"] = explicit_api_mode
+
+        return resolved_model, resolved_runtime
 
     def _apply_session_model_override(
         self, session_key: str, model: str, runtime_kwargs: dict
